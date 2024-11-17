@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Student Dashboard</title>
+</head>
+<body>
+    <h1>Welcome to the Student Dashboard</h1>
+    <br>
+    <!-- Display messages -->
+    {% if messages %}
+        <ul class="messages">
+            {% for message in messages %}
+                <li{% if message.tags %} class="{{ message.tags }}"{% endif %}>{{ message }}</li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+    
+    <h2>Select Your Class</h2>
+    <h5>(access your class home page)</h5>
+    <form method="post" action="{% url 'student_dashboard' %}">  <!-- Change here -->
+        {% csrf_token %}
+        {{ form.class_choice }}  <!-- This renders the dropdown for class_choice -->
+        <button type="submit">Submit Class Selection</button>
+    </form>
+    <br><br>
+    <h2>Change Password</h2>
+    <form method="post">
+        {% csrf_token %}
+        {{ password_form.as_p }}  <!-- Render password change fields -->
+        <button type="submit">Change Password</button>
+    </form>
+    <br><br>
+    <form action="{% url 'logout' %}" method="post">
+        {% csrf_token %}
+        <button type="submit">Log Out</button>
+    </form>
+</body>
+</html>
+

@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Admin Dashboard</title>
+</head>
+<body>
+    <h1>Welcome to the Admin Dashboard</h1>
+    
+    <!-- Button to go to Django Admin, use an <a> tag instead of a form -->
+    <a href="{% url 'admin:index' %}">
+        <button type="button">Go to Django Admin</button>
+    </a>
+
+    
+    <!-- Log Out button (this can remain as a form since it's submitting a POST request) -->
+    <form action="{% url 'logout' %}" method="post">
+        {% csrf_token %}
+        <button type="submit">Log Out</button>
+    </form>
+</body>
+</html>

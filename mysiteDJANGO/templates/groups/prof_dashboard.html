@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Professor Dashboard</title>
+</head>
+<body>
+    <h1>Welcome to the Professor Dashboard</h1>
+    <br>
+    
+    <!-- Group Creation Form -->
+    <h2>Create a New Class</h2>
+    <form method="POST" enctype="multipart/form-data">
+    {% csrf_token %}
+    {{ group_form.as_p }}
+    <button type="submit" name="create_group">Create Class</button>
+    </form>
+    <br>
+    <!-- Existing Classes -->
+    <h2>Existing Classes</h2>
+    <ul>
+        {% for class in existing_classes %}
+            <li>{{class.1}}</li>  <!-- Display the class name -->
+        {% empty %}
+            <li>No existing classes available.</li>  <!-- Message if no classes exist -->
+        {% endfor %}
+    </ul>
+    <br><br><br>
+
+
+
+    <form method="POST" enctype="multipart/form-data">
+        {% csrf_token %}
+        
+        <!-- Select Class Dropdown -->
+        <h2>Select Class</h2>
+        {{ class_select_form.as_p }}
+        <button type="submit" name="select_class">Select Class</button>
+    
+        
+    
+        <!-- Optional Upload Roster Form -->
+        <h2>Upload Student Roster</h2>
+        {% if upload_form %}
+            {{ upload_form.as_p }}
+            <button type="submit" name="upload_roster">Upload Roster</button>
+        {% endif %}
+        <br><br>
+
+        <!-- Optional Upload Class Data Form -->
+        <h2>Upload Class Data</h2>
+        {% if class_data_form %}
+            {{ class_data_form.as_p }}
+            <button type="submit" name="upload_class_data">Upload Class Data</button>
+        {% endif %}
+        <br><br>
+    
+        <!-- Display success/error messages -->
+        {% if messages %}
+            <ul class="messages">
+                {% for message in messages %}
+                    <li {% if message.tags %} class="{{ message.tags }}" {% endif %}>{{ message }}</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+    </form>
+
+    <form action="{% url 'logout' %}" method="post">
+        {% csrf_token %}
+        <button type="submit">Log Out</button>
+    </form>
+
+
+</body>
+</html>
+
+    

@@ -1,0 +1,8 @@
+.env
+.venv/
+temp/
+*.sqlite3
+.DS_Store
+.DS_Store/
+features_to_add
+__pycache__
