@@ -189,7 +189,7 @@ def upload_class_data(request):
                     
                     #blob path storage for transcriptions
                     if folder_name == f'{class_name.replace(" ", "_")}_MP4s':
-                        full_blob_name = f'{class_name}/{folder_name}/{file_name}'
+                        full_blob_name = f'{base_azure_path}/{folder_name}/{file_name}'
                         blob_paths.append(full_blob_name)
                     
                     #azure file path
@@ -201,8 +201,9 @@ def upload_class_data(request):
                         default_storage.save(azure_path, file_content)
 
         #call the background task to transcribe any mp4 files
-        if blob_paths:  
-            tasks.process_uploaded_files(class_name, blob_paths)
+        if blob_paths:
+            blob_class = f'{class_name}_data'  
+            tasks.process_uploaded_files(blob_class, blob_paths)
         
         # Clean up temporary files and folder after upload
         os.remove(temp_zip_path)
