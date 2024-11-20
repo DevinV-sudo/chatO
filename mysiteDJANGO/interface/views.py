@@ -3,8 +3,9 @@
 from .models import ClassModel, Student
 from .forms import GroupForm, UploadRosterForm, SelectClassForm, FolderUploadForm
 
-#import tasks
+#import tasks and settings
 from transcript import tasks
+from django.conf import settings
 
 #django contrib imports
 from django.contrib import messages
@@ -35,6 +36,10 @@ import csv
 #misc. django imports
 from django.shortcuts import render, redirect
 from django.http import HttpResponseNotFound
+
+#import blob client
+from azure.storage.blob import BlobClient
+
 
 
 
@@ -195,10 +200,24 @@ def upload_class_data(request):
                     #azure file path
                     azure_path = os.path.join(base_azure_path, folder_name, file_name)
 
-                    # Open and read each file, then save to Azure Blob Storage
-                    with open(os.path.join(root, file_name), 'rb') as file:
-                        file_content = ContentFile(file.read())
-                        default_storage.save(azure_path, file_content)
+                    #Checking if a file exists before uploading
+                    blob_name = f'{base_azure_path}/{folder_name}/{file_name}'
+                    connection_string = settings.AZURE_CONNECTION_STRING
+                    container_name = settings.AZURE_CONTAINER
+                    blob = BlobClient.from_connection_string(conn_str=connection_string,
+                                                            container_name=container_name,
+                                                            blob_name=blob_name )
+
+                    #check if current file already exists, if not upload
+                    if not blob.exists():
+
+                        # Open and read each file, then save to Azure Blob Storage
+                        with open(os.path.join(root, file_name), 'rb') as file:
+                            file_content = ContentFile(file.read())
+                            default_storage.save(azure_path, file_content)
+
+                    else:
+                        messages.error(request, f'{file_name} already exists in class data')
 
         #call the background task to transcribe any mp4 files
         if blob_paths:
@@ -210,6 +229,9 @@ def upload_class_data(request):
         shutil.rmtree('temp_unzipped')
 
         messages.success(request, 'Class data folder uploaded to Azure Blob Storage successfully!')
+
+        
+        
     return class_data_form, class_select_form
 
 def prof_dashboard(request):
