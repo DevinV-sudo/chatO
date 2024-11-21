@@ -1,4 +1,5 @@
-from background_task import background
+from celery import shared_task
+# from background_task import background
 from azure.storage.blob import BlobServiceClient
 from django.conf import settings
 from moviepy.editor import VideoFileClip
@@ -6,6 +7,8 @@ import whisper
 import os
 import re
 import shutil
+import logging
+logger = logging.getLogger(__name__)
 
 #create client
 blob_service_client = BlobServiceClient.from_connection_string(settings.AZURE_CONNECTION_STRING)
@@ -14,7 +17,7 @@ blob_service_client = BlobServiceClient.from_connection_string(settings.AZURE_CO
 whisper_model = whisper.load_model('base')  # Load the model once
 
 
-@background(schedule=0)
+@shared_task(acks_late=True)
 def process_uploaded_files(class_name, files):
     container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
     temp_download_dir = f"temp/{class_name}"
@@ -26,7 +29,7 @@ def process_uploaded_files(class_name, files):
         for blob_name in files:
             download_path = os.path.join(temp_download_dir, os.path.basename(blob_name))
             blob_client = container_client.get_blob_client(blob_name)
-            print(blob_name)
+            logger.info(f"starting processing for {blob_name}")
 
             with open(download_path, "wb") as download_file:
                 download_file.write(blob_client.download_blob().readall())
@@ -42,17 +45,18 @@ def process_uploaded_files(class_name, files):
                 video_clip.close()
                 output_paths.append(output_audio_path)
             except Exception as e:
-                print(f"Error processing video file {download_path}: {e}")
+                logger.info(f"Error processing video file {download_path}: {e}")
             finally:
                 os.remove(download_path)
     except Exception as e:
-        print(f"Error processing uploaded files for {class_name}: {e}")
+        logger.info(f"Error processing uploaded files for {class_name}: {e}")
         raise
-
+    
+    logger.info("beginning whisper transcription")
     whisper_transcription(class_name=class_name, mp3_files=output_paths)
 
 
-@background(schedule=0)
+@shared_task(acks_late=True)
 def whisper_transcription(class_name, mp3_files):
     temp_transcript_dir = f"temp/{class_name}/transcripts"
     os.makedirs(temp_transcript_dir, exist_ok=True)
@@ -71,12 +75,14 @@ def whisper_transcription(class_name, mp3_files):
 
             transcript_files.append(transcription_file)
         except Exception as e:
-            print(f"Error transcribing audio file {audio_path}: {e}")
+            logger.info(f"Error transcribing audio file {audio_path}: {e}")
     
     # Proceed to upload transcriptions
+    logger.info("Uploading transcriptions to Azure blob storage")
     upload_transcriptions(class_name, transcript_files)
 
-@background(schedule=0)
+    
+@shared_task(acks_late=True)
 def upload_transcriptions(class_name, transcript_files):
     temp_download_dir = f'temp/{class_name}'
     try:
@@ -92,18 +98,18 @@ def upload_transcriptions(class_name, transcript_files):
 
                 os.remove(transcript_file)  # Clean up local file after upload
             except Exception as e:
-                print(f"Error uploading {transcript_file}: {e}")
+                logger.info(f"Error uploading {transcript_file}: {e}")
 
-        print(f"Successfully uploaded {len(transcript_files)} transcripts for {class_name}")
+        logger.info(f"Successfully uploaded {len(transcript_files)} transcripts for {class_name}")
     except Exception as e:
-        print(f"Error uploading transcripts for {class_name}: {e}")
+        logger.info(f"Error uploading transcripts for {class_name}: {e}")
         raise
     try:
         shutil.rmtree(temp_download_dir)
-        print(f"Temporary directory {temp_download_dir} cleared.")
+        logger.info(f"Temporary directory {temp_download_dir} cleared.")
     except Exception as e:
-        print(f"Error clearing temporary directory {temp_download_dir}: {e}")
+        logger.info(f"Error clearing temporary directory {temp_download_dir}: {e}")
 
-    return None
+
 
 

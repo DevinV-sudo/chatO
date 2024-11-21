@@ -40,6 +40,9 @@ from django.http import HttpResponseNotFound
 #import blob client
 from azure.storage.blob import BlobClient
 
+#importing celery tasks
+from transcript.tasks import process_uploaded_files
+
 
 
 
@@ -221,8 +224,8 @@ def upload_class_data(request):
 
         #call the background task to transcribe any mp4 files
         if blob_paths:
-            blob_class = f'{class_name}_data'  
-            tasks.process_uploaded_files(blob_class, blob_paths)
+            blob_class = base_azure_path
+            process_uploaded_files.delay(blob_class, blob_paths)
         
         # Clean up temporary files and folder after upload
         os.remove(temp_zip_path)

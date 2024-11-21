@@ -48,7 +48,9 @@ INSTALLED_APPS = [
     "interface",
     "files",
     "storages",
-    "background_task"
+    "background_task",
+    "django_celery_results",
+    "django_celery_beat",
     ]
 
 MIDDLEWARE = [
@@ -141,6 +143,14 @@ LOGOUT_REDIRECT_URL = "home"
 
 #email redirect
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+
+#celery stuff
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'
 
 #Azure storage info
 STORAGES = {
