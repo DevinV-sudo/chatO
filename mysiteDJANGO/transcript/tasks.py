@@ -109,6 +109,7 @@ def upload_transcriptions(class_name, transcript_files):
         logger.info(f"Temporary directory {temp_download_dir} cleared.")
     except Exception as e:
         logger.info(f"Error clearing temporary directory {temp_download_dir}: {e}")
+        raise
 
 
 
