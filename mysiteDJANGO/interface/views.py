@@ -41,7 +41,13 @@ from django.http import HttpResponseNotFound
 from azure.storage.blob import BlobClient
 
 #importing celery tasks
-from transcript.tasks import process_uploaded_files
+from transcript.tasks import process_uploaded_files, documents_to_partition, whisper_transcription, upload_transcriptions, upload_partitions
+from celery import chain, signature
+import logging
+
+#initialize logger
+logger = logging.getLogger(__name__)
+
 
 
 
@@ -175,7 +181,8 @@ def upload_class_data(request):
         }#
 
         #blob paths for transcriptions
-        blob_paths = []
+        MP4_paths = []
+        PDF_paths = []
 
         # Extract the .zip file and iterate over files
         with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
@@ -198,8 +205,13 @@ def upload_class_data(request):
                     #blob path storage for transcriptions
                     if folder_name == f'{class_name.replace(" ", "_")}_MP4s':
                         full_blob_name = f'{base_azure_path}/{folder_name}/{file_name}'
-                        blob_paths.append(full_blob_name)
+                        MP4_paths.append(full_blob_name)
                     
+                    #blob path storage for PDFS
+                    elif folder_name == f'{class_name.replace(" ", "_")}_PDFs':
+                        full_blob_name = f'{base_azure_path}/{folder_name}/{file_name}'
+                        PDF_paths.append(full_blob_name)
+
                     #azure file path
                     azure_path = os.path.join(base_azure_path, folder_name, file_name)
 
@@ -222,18 +234,29 @@ def upload_class_data(request):
                     else:
                         messages.error(request, f'{file_name} already exists in class data')
 
-        #call the background task to transcribe any mp4 files
-        if blob_paths:
+        # Call the background task to transcribe any mp4 files
+        if MP4_paths:
             blob_class = base_azure_path
-            process_uploaded_files.delay(blob_class, blob_paths)
-        
+            transcript_chain = chain(
+                process_uploaded_files.s(blob_class, MP4_paths, PDF_paths),
+                whisper_transcription.s(),
+                upload_transcriptions.s(),
+                documents_to_partition.s(),
+                upload_partitions.s()).apply_async()
+            
+        else:
+            blob_class = base_azure_path
+            data = (blob_class, MP4_paths, PDF_paths)
+            partition_chain = chain(
+                documents_to_partition.s(data),
+                upload_partitions.s()
+            ).apply_async()
+            
         # Clean up temporary files and folder after upload
         os.remove(temp_zip_path)
         shutil.rmtree('temp_unzipped')
 
         messages.success(request, 'Class data folder uploaded to Azure Blob Storage successfully!')
-
-        
         
     return class_data_form, class_select_form
 
