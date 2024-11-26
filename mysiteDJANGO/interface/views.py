@@ -41,16 +41,12 @@ from django.http import HttpResponseNotFound
 from azure.storage.blob import BlobClient
 
 #importing celery tasks
-from transcript.tasks import process_uploaded_files, documents_to_partition, whisper_transcription, upload_transcriptions, upload_partitions
+from transcript.tasks import process_uploaded_files, documents_to_partition, whisper_transcription, upload_transcriptions, upload_partitions,create_pinecone_index, unstructured_pipeline
 from celery import chain, signature
 import logging
 
 #initialize logger
 logger = logging.getLogger(__name__)
-
-
-
-
 
 def create_directories(base_path, folders):
     """Helper function to create directories."""
@@ -242,15 +238,18 @@ def upload_class_data(request):
                 whisper_transcription.s(),
                 upload_transcriptions.s(),
                 documents_to_partition.s(),
-                upload_partitions.s()).apply_async()
+                upload_partitions.s(),
+                create_pinecone_index.s(),
+                unstructured_pipeline.s()).apply_async()
             
         else:
             blob_class = base_azure_path
             data = (blob_class, MP4_paths, PDF_paths)
             partition_chain = chain(
                 documents_to_partition.s(data),
-                upload_partitions.s()
-            ).apply_async()
+                upload_partitions.s(),
+                create_pinecone_index.s(),
+                unstructured_pipeline.s()).apply_async()
             
         # Clean up temporary files and folder after upload
         os.remove(temp_zip_path)
