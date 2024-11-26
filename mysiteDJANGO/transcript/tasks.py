@@ -14,9 +14,27 @@ import os
 import re
 import shutil
 import logging
+import time
 
-#pdf packages
-import fitz
+#import numpy
+import numpy as np
+
+#import pinecone
+from pinecone import Pinecone, ServerlessSpec
+
+#import unstructured requirements
+from unstructured_ingest.v2.pipeline.pipeline import Pipeline
+from unstructured_ingest.v2.interfaces import ProcessorConfig
+from unstructured_ingest.v2.processes.partitioner import PartitionerConfig
+from unstructured_ingest.v2.processes.connectors.fsspec.azure import (
+    AzureIndexerConfig,
+    AzureDownloaderConfig,
+    AzureConnectionConfig,
+    AzureAccessConfig
+)
+from unstructured_ingest.v2.processes.connectors.pinecone import (PineconeConnectionConfig, PineconeAccessConfig, PineconeUploaderConfig, PineconeUploadStagerConfig)
+from unstructured_ingest.v2.processes.chunker import ChunkerConfig
+from unstructured_ingest.v2.processes.embedder import EmbedderConfig
 
 #logging for celery tasks
 logger = logging.getLogger(__name__)
@@ -27,13 +45,10 @@ blob_service_client = BlobServiceClient.from_connection_string(settings.AZURE_CO
 #load whisper model
 whisper_model = whisper.load_model('base')  # Load the model once
 
-#import numpy
-import numpy as np
+#pinecone auth services
+pinecone_api_key = settings.PINECONE_API_KEY
+pc = Pinecone(api_key=pinecone_api_key)
 
-
-'''
-Take in pdf paths at begining, pass out transcript paths, pdf paths, class name to partition links, make one chain
-'''
 @shared_task(acks_late=True, bind=True)
 def process_uploaded_files(self, class_name, MP4_files, PDF_files):  # renamed parameter to avoid confusion
     container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
@@ -74,7 +89,6 @@ def process_uploaded_files(self, class_name, MP4_files, PDF_files):  # renamed p
     logger.info(f"PROCESS FILES END - Returning data: {data}")
 
     return data
-
 
 @shared_task(acks_late=True, bind=True)
 def whisper_transcription(self, data):
@@ -143,8 +157,6 @@ def upload_transcriptions(self, data):
     logger.info("preparing documents to partition")
     data = class_name, transcript_paths, PDF_files
     return data
-    
-
 
 def num_pages(blob_path):
     page_count = 0
@@ -166,8 +178,6 @@ def num_pages(blob_path):
     except Exception as e:
         logger.error(f"Failed to calculate page count for blob '{blob_path}': {e}")
         return 0
-
-
 
 @shared_task(ack_late=True, bind=True)
 def documents_to_partition(self, data):
@@ -226,7 +236,6 @@ def documents_to_partition(self, data):
     data = (class_name, partition_docs, temp_part_dir)
     return data       
 
-#WORKING ON THIS NEED TO FINISH TODAY
 @shared_task(acks_late=True, bind=True)
 def upload_partitions(self, data):
     class_name, paritition_docs, temp_part_dir = data
@@ -272,7 +281,147 @@ def upload_partitions(self, data):
         shutil.rmtree(temp_part_dir)
     except OSError as e:
         logger.warning(f"Failed to delete {temp_part_dir}: {e}", exc_info=True)
+    return class_name
+
+@shared_task(ack_late=True, bind=True)
+def create_pinecone_index(self, class_name):
+    logger.info(f"[{self.request.id}] Creating Pinecone index for class: {class_name}")
+    index_name = class_name.lower().replace("_", "-").replace(" ", "-").strip()
+    try:
+        existing_indexes = [index_info["name"] for index_info in pc.list_indexes()]
+        logger.debug(f"Existing indexes: {existing_indexes}")
+
+        if index_name not in existing_indexes:
+            logger.debug(f"Creating new index {index_name} with dimension 3072")
+            pc.create_index(
+                name=index_name,
+                dimension=3072,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            )
+            logger.info(f"[{self.request.id}] Created Pinecone index: {index_name}")
+
+            while not pc.describe_index(index_name).status["ready"]:
+                logger.debug(f"Waiting for index {index_name} to be ready...")
+                time.sleep(1)
+
+            index = pc.Index(index_name)
+            stats = index.describe_index_stats()
+            logger.info(f"[{self.request.id}] Pinecone index ready: {index_name}")
+            logger.debug(f"Initial index stats: {stats}")
+            data = (class_name, index_name)
+            return data
+        else:
+            logger.info(f"[{self.request.id}] Index already exists: {index_name}")
+            index = pc.Index(index_name)
+            stats = index.describe_index_stats()
+            logger.debug(f"Existing index stats: {stats}")
+            data = (class_name, index_name)
+            return data
+
+    except Exception as e:
+        logger.error(f"[{self.request.id}] Error creating Pinecone index: {e}", exc_info=True)
+        raise
+
+@shared_task(ack_late=True, bind=True)
+def unstructured_pipeline(self, data):
+    class_name, index_name = data
+    
+    #logging pipeline initialization
+    logger.info(f"Processing data from {class_name}, Uploading to Pinecone Index: {index_name}\n")
+    
+    #set up temporary directories
+    partition_directory = f"temp/{class_name}_unstructured/"
+    os.makedirs(partition_directory, exist_ok=True)
+
+    try:
+        #beginning pipeline
+        logger.info(f"[{self.request.id}] Starting partition_documents task for class: {class_name}")
+        
+        #reporting intial index stats
+        index = pc.Index(index_name)
+        initial_stats = index.describe_index_stats()
+        logger.info(f"Initial index stats: {initial_stats}")
+        
+        #pipeline
+        Pipeline.from_configs(
+            context=ProcessorConfig(),
+            indexer_config=AzureIndexerConfig(remote_url=f"az://django-container/{class_name}_partition_bucket/"),
+            downloader_config=AzureDownloaderConfig(download_dir = partition_directory),
+            source_connection_config=AzureConnectionConfig(
+                access_config=AzureAccessConfig(
+                    account_name=settings.AZURE_ACCOUNT_NAME,
+                    sas_token=settings.AZURE_SAS_TOKEN,
+                )
+            ),
+            partitioner_config=PartitionerConfig(
+                partition_by_api=True,
+                api_key=settings.UNSTRUCTURED_API_KEY,
+                partition_endpoint=settings.UNSTRUCTURED_URL,
+                strategy="fast",
+                additional_partition_args={
+                    "split_pdf_page": True,
+                    "split_pdf_allow_failed": True,
+                    "split_pdf_concurrency_level": 15,
+                    "extract_image_block_types": [],
+                },
+            ),
+            chunker_config=ChunkerConfig(
+                chunk_by_api = True,
+                chunk_api_key=settings.UNSTRUCTURED_API_KEY,
+                chunking_strategy="by_similarity",
+                chunk_similarity_threshold=0.75,  # Try increasing this
+                chunk_max_characters=1000,  # Try increasing this
+                chunk_new_after_n_characters=750,  # Adjust this                
+                chunk_include_original_elements=True,
+                chunkmultipage_sections=True,
+                chunk_overlap=100,  # Try increasing overlap
+            ),
+            embedder_config=EmbedderConfig(
+                embedding_provider="openai",
+                embedding_model_name="text-embedding-3-large",
+                embedding_api_key=settings.OPENAI_API_KEY,
+            ),
+            destination_connection_config=PineconeConnectionConfig(
+                access_config=PineconeAccessConfig(
+                    api_key=settings.PINECONE_API_KEY
+                ),
+                index_name= index_name
+            ),
+            
+            stager_config=PineconeUploadStagerConfig(),
+            uploader_config=PineconeUploaderConfig()
+        ).run()
+        
+        #report completion
+        logger.info(f"[{self.request.id}] Partitioning completed for class: {class_name}")
+
+        # Verify upload success
+        logger.info("Pipeline execution completed. Verifying results...")
+        final_stats = index.describe_index_stats()
+        logger.info(f"Final index stats: {final_stats}")
+        
+        if final_stats['total_vector_count'] == initial_stats['total_vector_count']:
+            logger.warning("No new vectors were added to the index")
+            logger.debug(f"Initial count: {initial_stats['total_vector_count']}")
+            logger.debug(f"Final count: {final_stats['total_vector_count']}")
+        else:
+            vectors_added = final_stats['total_vector_count'] - initial_stats['total_vector_count']
+            logger.info(f"Successfully added {vectors_added} vectors to the index")
+            
+        logger.info(f"[{self.request.id}] Partitioning completed for class: {class_name}")
+    
+    except Exception as e:
+        logger.error(f"[{self.request.id}] Error partitioning documents: {e}", exc_info=True)
+        raise
+    finally:
+        # Clean up temp directory
+        if os.path.exists(partition_directory):
+            shutil.rmtree(partition_directory)
+        logger.info(f"Cleaned up temporary directory: {partition_directory}")
 
 
 
+        
+    
 
