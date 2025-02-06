@@ -3,6 +3,7 @@ from celery import shared_task
 
 #import azure tools
 from azure.storage.blob import BlobServiceClient
+import azure
 from django.conf import settings
 
 #video-audio-text packages
@@ -15,26 +16,15 @@ import re
 import shutil
 import logging
 import time
+from dotenv import load_dotenv
+from celery.exceptions import SoftTimeLimitExceeded
+
 
 #import numpy
 import numpy as np
 
 #import pinecone
 from pinecone import Pinecone, ServerlessSpec
-
-#import unstructured requirements
-from unstructured_ingest.v2.pipeline.pipeline import Pipeline
-from unstructured_ingest.v2.interfaces import ProcessorConfig
-from unstructured_ingest.v2.processes.partitioner import PartitionerConfig
-from unstructured_ingest.v2.processes.connectors.fsspec.azure import (
-    AzureIndexerConfig,
-    AzureDownloaderConfig,
-    AzureConnectionConfig,
-    AzureAccessConfig
-)
-from unstructured_ingest.v2.processes.connectors.pinecone import (PineconeConnectionConfig, PineconeAccessConfig, PineconeUploaderConfig, PineconeUploadStagerConfig)
-from unstructured_ingest.v2.processes.chunker import ChunkerConfig
-from unstructured_ingest.v2.processes.embedder import EmbedderConfig
 
 #logging for celery tasks
 logger = logging.getLogger(__name__)
@@ -43,14 +33,26 @@ logger = logging.getLogger(__name__)
 blob_service_client = BlobServiceClient.from_connection_string(settings.AZURE_CONNECTION_STRING)
 
 #load whisper model
-whisper_model = whisper.load_model('base')  # Load the model once
+whisper_model = whisper.load_model('medium')  # Load the model once
 
 #pinecone auth services
 pinecone_api_key = settings.PINECONE_API_KEY
 pc = Pinecone(api_key=pinecone_api_key)
 
+#importing pdf handling libraries
+import pymupdf
+import pytesseract
+from PIL import Image
+import pytesseract
+from pdf2image import convert_from_path
+import fitz
+
+#llama parse
+from llama_parse import LlamaParse
+from llama_index.core import SimpleDirectoryReader
+
 @shared_task(acks_late=True, bind=True)
-def process_uploaded_files(self, class_name, MP4_files, PDF_files):  # renamed parameter to avoid confusion
+def process_uploaded_files(self, class_name, MP4_files):  # renamed parameter to avoid confusion
     container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
     temp_download_dir = f"temp/{class_name}"
     processed_mp3_files = []  # new name to avoid shadowing
@@ -85,7 +87,7 @@ def process_uploaded_files(self, class_name, MP4_files, PDF_files):  # renamed p
         raise
     
     logger.info("beginning whisper transcription")
-    data = (class_name, processed_mp3_files, PDF_files)  # return the processed files
+    data = (class_name, processed_mp3_files)  # return the processed files
     logger.info(f"PROCESS FILES END - Returning data: {data}")
 
     return data
@@ -95,7 +97,7 @@ def whisper_transcription(self, data):
     logger.info(f"WHISPER START - Received data type: {type(data)}")
     logger.info(f"WHISPER START - Raw data: {data}")
     
-    class_name, mp3_files, PDF_files = data
+    class_name, mp3_files= data
     temp_transcript_dir = f"temp/{class_name}/transcripts"
     os.makedirs(temp_transcript_dir, exist_ok=True)
     
@@ -103,10 +105,10 @@ def whisper_transcription(self, data):
 
     for audio_path in mp3_files:
         try:
+            logger.info(f"Starting transcription for: {audio_path}")
             transcription_name = os.path.splitext(os.path.basename(audio_path))[0]
             transcription_file = os.path.join(temp_transcript_dir, f"{transcription_name}_transcription.txt")
-
-            # Transcribe and write to file
+            
             transcription_text = whisper_model.transcribe(audio_path, fp16=False)["text"].strip()
             with open(transcription_file, "w") as f:
                 f.write(transcription_text)
@@ -114,15 +116,16 @@ def whisper_transcription(self, data):
             transcript_files.append(transcription_file)
         except Exception as e:
             logger.info(f"Error transcribing audio file {audio_path}: {e}")
+        
     
     # Proceed to upload transcriptions
     logger.info("Uploading transcriptions to Azure blob storage")
-    data = (class_name, transcript_files, PDF_files)
+    data = (class_name, transcript_files)
     return data
     
 @shared_task(acks_late=True, bind=True)
 def upload_transcriptions(self, data):
-    class_name, transcript_files, PDF_files = data
+    class_name, transcript_files = data
     temp_download_dir = f'temp/{class_name}'
     transcript_paths = []
 
@@ -155,71 +158,180 @@ def upload_transcriptions(self, data):
     
     #callling partition now
     logger.info("preparing documents to partition")
-    data = class_name, transcript_paths, PDF_files
+    data = class_name, transcript_paths
     return data
 
-def num_pages(blob_path):
-    page_count = 0
-    try:
-        container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
-        blob_client = container_client.get_blob_client(blob_path)
+def page_count(pymupdf_doc, curr_page_count):
+    #simply take pymupdf document and count pages
+    page_count=pymupdf_doc.page_count
 
-        # Get blob properties
-        blob_properties = blob_client.get_blob_properties()
-        blob_size = blob_properties.size  # Size in bytes
+    #compare with current page count
+    new_page_count = page_count + curr_page_count
 
-        # Calculate pages
-        size_in_100kb_units = blob_size / (100 * 1024)  # Convert to 100KB units
-        pages = int(size_in_100kb_units) + 1  # Add 1 to account for partial pages
-        
-        logger.info(f"Successfully calculated page count for blob '{blob_path}': {pages} pages")
-        return pages
-
-    except Exception as e:
-        logger.error(f"Failed to calculate page count for blob '{blob_path}': {e}")
-        return 0
+    #return the new count if less than max_pages
+    return new_page_count if new_page_count < 1000 else -1
 
 @shared_task(ack_late=True, bind=True)
-def documents_to_partition(self, data):
-    #unpacking data
-    logger.info("Determining documents to partition")
-    class_name, transcript_paths, PDF_files = data
+def allocate_processing(self, data):
+    logger.info(f"Allocating 1000 pages worth of data to process....\n")
     
-    #combining the paths for processing
-    data_paths = transcript_paths + PDF_files
+    #unpack the data 
+    class_name, PDF_files = data
 
-    #the azure container with the blobs for pdfs
+    #intialize the client
     container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
 
-    #storage for documents < 1000 pages
-    partition_bucket = []
-    queue = []
-    
-    page_count = 0
-
-    #iterate through each blob and determine if it is image heavy
-    temp_part_dir = f"temp/{class_name}_partitions"
+    #intialize the temporary directory for the parsed files
+    temp_part_dir = f"temp/{class_name}"
     os.makedirs(temp_part_dir, exist_ok=True)
 
+    #paths to process blob
+    process_paths = []
+
+    #keep track of the running page count
+    running_page_count = 0
+    #base blob destination path
+    base_dest = f"{class_name}/Processing/"
+
     try:
-        for blob in data_paths:
-            number_of_pages = num_pages(blob)
+        #try iterating though blob "pdf" paths
+        for blob in PDF_files:
             download_path = os.path.join(temp_part_dir, os.path.basename(blob))
             blob_client = container_client.get_blob_client(blob)
 
             try:
                 with open(download_path, "wb") as download_file:
                     download_file.write(blob_client.download_blob().readall())
+
+                #open the pdf as a pymupdf doc
+                with pymupdf.open(download_path) as doc:
+                    new_count = page_count(doc, running_page_count)
+
+                    if new_count == -1:
+                        logger.info(f"Skipping {blob}, exceeds max page limit.")
+                        continue
+                    
+                    running_page_count = new_count
+
+                    #set the destination path for selected blob
+                    destination_path = os.path.join(base_dest, os.path.basename(blob))### EDIT
+                    logger.info(f"Blob: {blob}\n\n")
+                    logger.info(f"blob-base.name: {os.path.basename(blob)}\n\n")
+                    logger.info(f"base_dest + blob(basename) = {destination_path}")
+                    process_paths.append(destination_path)
+
+                    #initialize destination blob client
+                    destination_blob_client = blob_service_client.get_blob_client(container=settings.AZURE_CONTAINER, blob=destination_path)
+
+                    #upload the file from the PDF blob
+                    with open(download_path, "rb") as upload_file:
+                        logger.info(f"Uploading Blob: {blob}")
+                        destination_blob_client.upload_blob(upload_file, overwrite=True)
+
+                    #delete the original file from the source
+                    logger.info(f"Removing Blob From Source")
+                    blob_client.delete_blob()
+
+            except Exception as e:
+                logger.error(f"Error uploading blob: {blob}, {e}")
+
+    finally:
+            # Clean up temporary directory
+            logger.info(f"Cleaning up temporary directory: {temp_part_dir}")
+            shutil.rmtree(temp_part_dir, ignore_errors=True)  
+
+    #return "data"
+    data = class_name, process_paths, temp_part_dir
+    return data
+
+
+@shared_task(ack_late=True, bind=True)
+def process_pdfs(self, data):
+    #unpacking data
+    class_name, process_paths, temp_part_dir = data
+
+    #start processing
+    logger.info("Trimming Unusable Chapters")
+    
+    #Initialize container client
+    container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
+
+    #paths for processed pdfs
+    processed_pdfs = []
+
+    temp_part_dir = f"temp/{class_name}_PDFS"
+    os.makedirs(temp_part_dir, exist_ok=True)
+
+    try:
+        for blob in process_paths:
+            download_path = os.path.join(temp_part_dir, os.path.basename(blob))
+            blob_client = container_client.get_blob_client(blob)
+
+            try:
+                with open(download_path, "wb") as download_file:
+                    download_file.write(blob_client.download_blob().readall())
+
+                with pymupdf.open(download_path) as doc:
+                    toc=doc.get_toc()
+
+                    if not toc:
+                        processed_pdfs.append(download_path)
+                        logger.info(f"Included entire document for {os.path.basename(download_path)}")
+                        continue
+            
+                    intro_patterns = {
+                        'introduction', 'preface', 'foreward', 'prologue',
+                        'acknowledgements', 'dedication', 'abstract'
+                    }
+                    
+                    end_patterns = {
+                        'glossary', 'appendix', 'appendices', 'index', 'bibliography',
+                        'references', 'notes', 'afterword', 'epilogue', 'conclusion',
+                        'acknowledgements', 'about the author', 'endnotes'
+                    }
+
+                    chapter_start_index = None
+                    for i, (level, title, page) in enumerate(toc):
+                        lower_title = title.lower()
+                    
+                        if any(pattern in lower_title for pattern in intro_patterns):
+                            continue
+                        
+                        chapter_start_index = i
+                        break
                 
-                if page_count + number_of_pages < 1000:
-                    partition_bucket.append(download_path)
-                    page_count += number_of_pages
-                    logger.info(f"Added {blob} to partition bucket, page count = {page_count}")
-                else:
-                    if not queue:
-                        logger.info(f"Starting queue with {blob}")
-                    queue.append(download_path)
-                    page_count = number_of_pages
+                    chapter_end_index = None
+                    for i, (level, title, page) in enumerate(reversed(toc)):
+                        lower_title = title.lower()
+                        if any(pattern in lower_title for pattern in end_patterns):
+                            continue
+                        chapter_end_index = len(toc) - 1 - i
+                        break    
+                    
+                    if chapter_start_index is None or chapter_end_index is None:
+                        processed_pdfs.append(download_path) 
+                        logger.info(f"Included entire document for {os.path.basename(download_path)}")
+                        continue
+                    
+                    first_chapter_page = toc[chapter_start_index][2] - 1
+                    last_chapter_page = toc[chapter_end_index][2] -1
+
+                    if chapter_end_index + 1 < len(toc):
+                        last_chapter_page = toc[chapter_end_index+1][2]-2
+                    
+                    new_doc = pymupdf.open()
+                    new_doc.insert_pdf(doc, from_page=first_chapter_page, to_page=last_chapter_page)
+    
+                    tmp_path = download_path + ".tmp"
+                    new_doc.save(tmp_path)
+                    new_doc.close()
+
+                    os.replace(tmp_path, download_path)
+                    processed_pdfs.append(download_path)
+
+                    logger.info(f"Successfully trimmed {os.path.basename(download_path)}")
+                    logger.info(f"Kept pages {first_chapter_page + 1} to {last_chapter_page + 1}")
+                    logger.info(f"Starting from '{toc[chapter_start_index][1]}' to '{toc[chapter_end_index][1]}'")
 
             except Exception as e:
                 logger.error(f"Failed to process {blob}: {e}")
@@ -231,57 +343,339 @@ def documents_to_partition(self, data):
         logger.error(f"An error occurred proccessing pdfs: {e}")
         raise
     
-    partition_docs = (partition_bucket, queue)
-    logger.info("Uploading partition documents to Azure Blob Storage")
-    data = (class_name, partition_docs, temp_part_dir)
-    return data       
+    data = class_name, processed_pdfs, temp_part_dir
+    return data                         
 
-@shared_task(acks_late=True, bind=True)
-def upload_partitions(self, data):
-    class_name, paritition_docs, temp_part_dir = data
-    partition_bucket, queue = paritition_docs
-    temp_download_dir = temp_part_dir
+def split_pdf(input_path, chunk_size=10):
+    #open the document as pymudpdf
+    doc = pymupdf.open(input_path)
+    total_pages = doc.page_count
 
-    logger.info("UPLOADING PARTITIONS")
-    try:
-        container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
+    #storage for output chunks
+    chunk_paths = []
+
+    #extract the original directory of the file
+    base_dir = os.path.dirname(input_path)
+
+    #extract file name
+    file_name = os.path.splitext(os.path.basename(input_path))[0]
+
+    #flag for sucessful chunking
+    success = True
+    #chunk the document
+    for start_page in range(0, total_pages, chunk_size):
+        end_page = min(start_page + chunk_size, total_pages)
+
+        #define the file out path
+        chunk_file_path = os.path.join(base_dir, f"{file_name}_chunk_{start_page}-{end_page}.pdf")
+
+        #create new document for each chunk
+        chunk_doc = pymupdf.open()
+        try:
+            chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page-1)
+
+            #save the chunk
+            chunk_doc.save(chunk_file_path)
+            chunk_paths.append(chunk_file_path)
         
-        for document in partition_bucket:
-            try:
-                blob_name = f"{class_name}_partition_bucket/{os.path.basename(document)}"
-                blob_client = container_client.get_blob_client(blob_name)
+        except Exception as e:
+            logging.error(f"Error Splitting {file_name}:{e}")
+            success = False
 
-                with open(document, "rb") as data:
-                    blob_client.upload_blob(data, overwrite=True)
-
-                os.remove(document)  # Clean up local file after upload
-            except Exception as e:
-                logger.info(f"Error uploading {document}: {e}")
-
-        logger.info(f"Successfully uploaded {len(partition_bucket)} partitions for {class_name}")
-
-        for document in queue:
-            try:
-                blob_name = f"{class_name}_partition_queue/{os.path.basename(document)}"
-                blob_client = container_client.get_blob_client(blob_name)
-
-                with open(document, "rb") as data:
-                    blob_client.upload_blob(data, overwrite=True)
-                os.remove(document)  # Clean up local file after upload
-            
-            except Exception as e:
-                logger.info(f"Error uploading {document}: {e}")
-        logger.info(f"Successfully uploaded {len(partition_bucket)} partitions for {class_name}")
-
-    except Exception as e:
-        logger.info(f"Error uploading partitions for {class_name}: {e}")
-        raise
+        #close the new document
+        finally:
+            chunk_doc.close()
     
+    #close the original docuement
+    doc.close()
+
+    #remove the original document from the directory:
+    if success and len(chunk_paths) > 0:
+        try:
+            os.remove(input_path)
+            logging.info(f"Removed original file: {input_path}")
+        
+        except Exception as e:
+            logging.error(f"Failed to remove the original file {input_path}: {e}")
+    else:
+        logging.error(f"Chunking failed for {input_path}, keeping original file.")
+
+    #compress the chunked file name and the paths
+    return chunk_paths if success else [input_path]
+
+def requires_chunking(pdf_path, threshold=50):
+    doc = pymupdf.open(pdf_path)
+    total_pages = doc.page_count
+    doc.close()
+
+    return total_pages>threshold
+
+
+@shared_task(ack_late=True, bind=True)
+def chunk_pdfs(self, data):
+    #unpack data
+    class_name, processed_pdfs, temp_part_dir = data
+    modified_pdf_paths = []
+    chunked_file_names = []
+
+    for pdf in processed_pdfs:
+        base_name = os.path.splitext(os.path.basename(pdf))[0]
+        
+        if requires_chunking(pdf, threshold=50):
+            logger.info(f"Chunking: {os.path.basename(pdf)}")
+            try:
+                chunk_paths = split_pdf(pdf, chunk_size=20)
+                if chunk_paths:
+                    modified_pdf_paths.extend(chunk_paths)
+                    chunked_file_names.append(base_name)
+                    logger.info(f"Added {len(chunk_paths)} chunks for: {base_name}")
+
+                else:
+                    logger.warning(f"Chunking failed for: {base_name}, keeping original")
+                    modified_pdf_paths.append(pdf)
+                    
+            except Exception as e:
+                logger.error(f"Error chunking {base_name}: {e}")
+                modified_pdf_paths.append(pdf)
+        
+        else:
+            logger.info(f"No Chunks Needed - Keeping Original:{os.path.basename(pdf)}")
+            modified_pdf_paths.append(pdf)
+
+    #compress results to send to llama-parse
+    data = class_name, modified_pdf_paths, temp_part_dir
+
+    #return the compressed results
+    return data
+
+@shared_task(ack_late=True, bind=True)
+def llama_parse_batch(self, data):
+    #unpack data
+    class_name, processed_pdfs, temp_part_dir = data
+   
+    #define the parser
+    parser = LlamaParse(
+        api_key = settings.LLAMA_CLOUD_API_KEY,
+        result_type="markdown",
+        extract_layout=True,
+        num_workers = 4,
+        verbose=True
+        # use_vendor_multimodal_model=True,
+        # vendor_multimodal_model_name="openai-gpt-4o-mini",
+        # vendor_multimodal_api_key = settings.OPENAI_API_KEY
+    )
+
+    #intialize extractor
+    file_extractor = {".pdf": parser}
+    documents = []
+
+    #use a set to avoid repeats
+    successful_blob_names = set()
+    error_blob_names = set()
+
+    successful_extractions = {}
+
+    #processed pdfs is file_paths to temp directory
+    logger.info(f"Beginning parse of {len(processed_pdfs)} PDFs")
+    
+    for pdf_path in processed_pdfs:
+        max_retries = 3
+        retry_delay = 5
+        base_name = os.path.basename(pdf_path)
+
+        for attempt in range(max_retries):
+            try:
+                doc = SimpleDirectoryReader(input_files = [pdf_path],
+                                            file_extractor=file_extractor).load_data()
+
+                if doc:
+                    successful_extractions[pdf_path] = doc[0]
+
+                    #check if the parsed file is a chunk file:
+                    match = re.match(r"(.+)_chunk_\d+-\d+\.pdf", base_name)
+                    if match:
+                        #if it is add just the source file name
+                        source_file_name = match.group(1)+".pdf"
+                        logger.info(f"adding chunk base file to success: {source_file_name}")
+                        successful_blob_names.add(source_file_name)
+
+                    else:
+                        #if its not a chunk just add its base name
+                        logger.info(f"adding file name to success: {base_name}")
+                        successful_blob_names.add(base_name)
+
+                    logger.info(f"Successfully extracted: {os.path.basename(pdf_path)}")
+                    documents.extend(doc)
+                    break
+                
+                else:
+                    logger.info("Document Parsing Returned Empty")
+
+            except Exception as e:
+                logger.error(f"Error Processing {pdf_path}: {e}")
+                
+                if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                    wait_time = min(retry_delay * (2 ** attempt), 30)
+                    logger.warning(f"Attempt {attempt + 1} failed for {pdf_path}: {e}. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                
+                else:
+                    logger.error(f"All attempts failed for {pdf_path} after {max_retries} retries: {e}")
+                    
+                    #check for the chunked file names we may have to move the file name
+                    error_match = re.match(r"(.+)_chunk_\d+-\d+\.pdf", base_name)
+                    if error_match:
+                        error_file_name = match.group(1)+".pdf"
+                        error_blob_names.add(error_file_name)
+                        logger.info(f"adding chunk source file to error: {error_file_name}")
+                    else:
+                        error_blob_names.add(base_name)
+                        logger.info(f"adding file name to error {base_name}")
+    
+    #moving error blobs to the error outer blob in azure
+    for error_blob in error_blob_names:
+        
+        #set up source and destination blob paths
+        error_blob_path = f"{class_name}/Error/{error_blob}"
+        source_blob_path = f"{class_name}/Processing/{error_blob}"
+
+        #logging for testing
+        logger.info(f"Moving Failed Parsed: {error_blob} from {source_blob_path} to {error_blob_path}")
+
+        #move the blobs to the error outer blob
+        try:
+            #get source blob client
+            source_blob_client = blob_service_client.get_blob_client(container=settings.AZURE_CONTAINER, blob=source_blob_path)
+            
+            #check to see if blob exists in source
+            if not source_blob_client.exists():
+                logger.warning(f"Source not found: {source_blob_path}")
+                continue
+
+            #load in destination blob client
+            dest_blob_client = blob_service_client.get_blob_client(container=settings.AZURE_CONTAINER, blob=error_blob_path)
+
+            #start upload process
+            copy_operation = dest_blob_client.start_copy_from_url(source_blob_client.url)
+
+            #wait for copy to complete:
+            while True:
+                props = dest_blob_client.get_blob_properties()
+                copy_status = props.copy.status
+
+                if copy_status == "success":
+                    logger.info(f"Successfully copied {error_blob} to {error_blob_path}")
+
+                    # Delete original blob from "Processing"
+                    source_blob_client.delete_blob()
+                    logger.info(f"Deleted original blob from {source_blob_path}")
+                    break
+
+                elif copy_status in ["failed", "aborted"]:
+                    logger.warning(f"Copy operation failed for {error_blob}. Status: {copy_status}")
+                    break
+
+                time.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Error moving {error_blob}: {e}")
+
+    # moving successfully parsed files to azure
+    for pdf_path, doc in successful_extractions.items():
+        try:
+            #set up a local temp for the output
+            local_md_dir = os.path.join(temp_part_dir, "markdown_outputs")
+            os.makedirs(local_md_dir, exist_ok=True)
+
+            #write the documents to file and upload as markdown to azure
+            base_azure_path = f"{class_name}/Markdown/"
+            container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
+
+            file_name = os.path.basename(pdf_path).replace(".pdf", ".md")
+            local_md_path = os.path.join(local_md_dir, file_name)
+            
+            # Write parsed output to local markdown file
+            with open(local_md_path, "w", encoding="utf-8") as md_file:
+                md_file.write(doc.text)
+            
+            # Upload markdown file to Azure Blob Storage
+            azure_blob_path = os.path.join(base_azure_path, file_name)
+            logger.info(f"Upload path for Azure:{azure_blob_path}\n")
+
+            #reading the local file to the azure blob
+            with open(local_md_path, "rb") as data:
+                data_bytes = data.read()
+                if len(data_bytes) == 0:
+                    logger.error(f"File {local_md_path} read as empty before upload!")
+
+                logger.info(f"Uploading:{file_name} to {azure_blob_path}\n")
+                container_client.upload_blob(name=azure_blob_path, data=data_bytes, overwrite=True)
+
+            #Succesfully uploaded
+            logger.info(f"Uploaded {file_name} to Azure at {azure_blob_path}")
+       
+        except Exception as e:
+            logger.error(f"Error uploading to Markdown: {e}")
+    logger.info("Markdown upload process completed!")
+    
+    #move successful uploads to the completed blob
+    completed_azure_path = f"{class_name}/Completed/"
+    source_azure_path = f"{class_name}/Processing/"
+
+    #iterate through success set
+    for completed_blob in successful_blob_names:
+        #concatentate paths
+        dest_path =f"{completed_azure_path}{completed_blob}"
+        source_path =f"{source_azure_path}{completed_blob}"
+
+        #logging for testing
+        logger.info(f"moving {completed_blob} to {dest_path} from {source_path}")
+
+        try:
+            #get source blob client
+            source_blob_client = blob_service_client.get_blob_client(container=settings.AZURE_CONTAINER, blob=source_path)
+            
+            #check to see if blob exists in source
+            if not source_blob_client.exists():
+                logger.warning(f"Source not found: {source_path}")
+                continue
+            
+            #load in destination blob client
+            dest_blob_client = blob_service_client.get_blob_client(container=settings.AZURE_CONTAINER, blob=dest_path)
+
+            #start upload process
+            copy_operation = dest_blob_client.start_copy_from_url(source_blob_client.url)
+
+            #wait for copy to complete:
+            while True:
+                props = dest_blob_client.get_blob_properties()
+                copy_status = props.copy.status
+
+                if copy_status == "success":
+                    logger.info(f"Successfully copied {completed_blob} to {dest_path}")
+
+                    # Delete original blob from "Processing"
+                    source_blob_client.delete_blob()
+                    logger.info(f"Deleted original blob from {source_path}")
+                    break
+
+                elif copy_status in ["failed", "aborted"]:
+                    logger.warning(f"Copy operation failed for {completed_blob}. Status: {copy_status}")
+                    break
+
+                time.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Error moving {completed_blob}: {e}")
+
     try:
         shutil.rmtree(temp_part_dir)
-    except OSError as e:
-        logger.warning(f"Failed to delete {temp_part_dir}: {e}", exc_info=True)
-    return class_name
+        logger.info(f"Successfully removed temporary directory: {temp_part_dir}")
+    except Exception as e:
+        logger.error(f"Error removing temporary directory {temp_part_dir}: {e}")
+
+    logger.info(f"Successfully Parsed Current Processing Batch")
+    return None
 
 @shared_task(ack_late=True, bind=True)
 def create_pinecone_index(self, class_name):
@@ -323,102 +717,6 @@ def create_pinecone_index(self, class_name):
         logger.error(f"[{self.request.id}] Error creating Pinecone index: {e}", exc_info=True)
         raise
 
-@shared_task(ack_late=True, bind=True)
-def unstructured_pipeline(self, data):
-    class_name, index_name = data
-    
-    #logging pipeline initialization
-    logger.info(f"Processing data from {class_name}, Uploading to Pinecone Index: {index_name}\n")
-    
-    #set up temporary directories
-    partition_directory = f"temp/{class_name}_unstructured/"
-    os.makedirs(partition_directory, exist_ok=True)
-
-    try:
-        #beginning pipeline
-        logger.info(f"[{self.request.id}] Starting partition_documents task for class: {class_name}")
-        
-        #reporting intial index stats
-        index = pc.Index(index_name)
-        initial_stats = index.describe_index_stats()
-        logger.info(f"Initial index stats: {initial_stats}")
-        
-        #pipeline
-        Pipeline.from_configs(
-            context=ProcessorConfig(),
-            indexer_config=AzureIndexerConfig(remote_url=f"az://django-container/{class_name}_partition_bucket/"),
-            downloader_config=AzureDownloaderConfig(download_dir = partition_directory),
-            source_connection_config=AzureConnectionConfig(
-                access_config=AzureAccessConfig(
-                    account_name=settings.AZURE_ACCOUNT_NAME,
-                    sas_token=settings.AZURE_SAS_TOKEN,
-                )
-            ),
-            partitioner_config=PartitionerConfig(
-                partition_by_api=True,
-                api_key=settings.UNSTRUCTURED_API_KEY,
-                partition_endpoint=settings.UNSTRUCTURED_URL,
-                strategy="fast",
-                additional_partition_args={
-                    "split_pdf_page": True,
-                    "split_pdf_allow_failed": True,
-                    "split_pdf_concurrency_level": 15,
-                    "extract_image_block_types": [],
-                },
-            ),
-            chunker_config=ChunkerConfig(
-                chunk_by_api = True,
-                chunk_api_key=settings.UNSTRUCTURED_API_KEY,
-                chunking_strategy="by_similarity",
-                chunk_similarity_threshold=0.75,  # Try increasing this
-                chunk_max_characters=1000,  # Try increasing this
-                chunk_new_after_n_characters=750,  # Adjust this                
-                chunk_include_original_elements=True,
-                chunkmultipage_sections=True,
-                chunk_overlap=100,  # Try increasing overlap
-            ),
-            embedder_config=EmbedderConfig(
-                embedding_provider="openai",
-                embedding_model_name="text-embedding-3-large",
-                embedding_api_key=settings.OPENAI_API_KEY,
-            ),
-            destination_connection_config=PineconeConnectionConfig(
-                access_config=PineconeAccessConfig(
-                    api_key=settings.PINECONE_API_KEY
-                ),
-                index_name= index_name
-            ),
-            
-            stager_config=PineconeUploadStagerConfig(),
-            uploader_config=PineconeUploaderConfig()
-        ).run()
-        
-        #report completion
-        logger.info(f"[{self.request.id}] Partitioning completed for class: {class_name}")
-
-        # Verify upload success
-        logger.info("Pipeline execution completed. Verifying results...")
-        final_stats = index.describe_index_stats()
-        logger.info(f"Final index stats: {final_stats}")
-        
-        if final_stats['total_vector_count'] == initial_stats['total_vector_count']:
-            logger.warning("No new vectors were added to the index")
-            logger.debug(f"Initial count: {initial_stats['total_vector_count']}")
-            logger.debug(f"Final count: {final_stats['total_vector_count']}")
-        else:
-            vectors_added = final_stats['total_vector_count'] - initial_stats['total_vector_count']
-            logger.info(f"Successfully added {vectors_added} vectors to the index")
-            
-        logger.info(f"[{self.request.id}] Partitioning completed for class: {class_name}")
-    
-    except Exception as e:
-        logger.error(f"[{self.request.id}] Error partitioning documents: {e}", exc_info=True)
-        raise
-    finally:
-        # Clean up temp directory
-        if os.path.exists(partition_directory):
-            shutil.rmtree(partition_directory)
-        logger.info(f"Cleaned up temporary directory: {partition_directory}")
 
 
 

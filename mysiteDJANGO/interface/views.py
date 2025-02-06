@@ -41,7 +41,7 @@ from django.http import HttpResponseNotFound
 from azure.storage.blob import BlobClient
 
 #importing celery tasks
-from transcript.tasks import process_uploaded_files, documents_to_partition, whisper_transcription, upload_transcriptions, upload_partitions,create_pinecone_index, unstructured_pipeline
+from transcript.tasks import process_uploaded_files,chunk_pdfs,llama_parse_batch,allocate_processing, process_pdfs, whisper_transcription, upload_transcriptions
 from celery import chain, signature
 import logging
 
@@ -152,6 +152,10 @@ def upload_class_data(request):
     class_select_form = SelectClassForm(request.POST)
 
     if class_data_form.is_valid() and class_select_form.is_valid():
+        #if the form is valid pull azure info (moved from line 221)
+        connection_string = settings.AZURE_CONNECTION_STRING  
+        container_name = settings.AZURE_CONTAINER
+
         selected_class = class_select_form.cleaned_data['class_choice']  # Get class ID or name directly
         uploaded_zip = request.FILES['class_data_folder']  # Uploaded .zip file
         
@@ -213,8 +217,9 @@ def upload_class_data(request):
 
                     #Checking if a file exists before uploading
                     blob_name = f'{base_azure_path}/{folder_name}/{file_name}'
-                    connection_string = settings.AZURE_CONNECTION_STRING
-                    container_name = settings.AZURE_CONTAINER
+                    
+                    #note moved security info out of loop
+
                     blob = BlobClient.from_connection_string(conn_str=connection_string,
                                                             container_name=container_name,
                                                             blob_name=blob_name )
@@ -229,27 +234,46 @@ def upload_class_data(request):
 
                     else:
                         messages.error(request, f'{file_name} already exists in class data')
+        
+        # add empty folders: Processing, Completed, Markdown, Error
+        empty_folder_names = ["Processing", "Completed", "Markdown", "Error",
+                              f"{class_name.replace(' ', '_')}_PDFs",
+                                f"{class_name.replace(' ', '_')}_MP4s"]
+        
+        #iterate through empty_folder_names
+        for folder in empty_folder_names:
+            blob_name = f"{base_azure_path}/{folder}/.empty"
+            blob_client = BlobClient.from_connection_string(conn_str=connection_string,
+                                                            container_name=container_name,
+                                                            blob_name=blob_name )
+
+            #if the intial folders exist skip, else upload the placeholders
+            if not blob_client.exists():
+                blob_client.upload_blob(b"",overwrite=True)
+                messages.success(request, f'Created sufficient placeholder: {folder}')
+            
+            else:
+                messages.info(request, f'{folder} already exists in class data')
 
         # Call the background task to transcribe any mp4 files
+        # Now segmented to be more effecient
         if MP4_paths:
             blob_class = base_azure_path
             transcript_chain = chain(
-                process_uploaded_files.s(blob_class, MP4_paths, PDF_paths),
+                process_uploaded_files.s(blob_class, MP4_paths),
                 whisper_transcription.s(),
-                upload_transcriptions.s(),
-                documents_to_partition.s(),
-                upload_partitions.s(),
-                create_pinecone_index.s(),
-                unstructured_pipeline.s()).apply_async()
+                upload_transcriptions.s()).apply_async()
             
-        else:
+        if PDF_paths:
             blob_class = base_azure_path
-            data = (blob_class, MP4_paths, PDF_paths)
+            data = (blob_class, PDF_paths)
             partition_chain = chain(
-                documents_to_partition.s(data),
-                upload_partitions.s(),
-                create_pinecone_index.s(),
-                unstructured_pipeline.s()).apply_async()
+                allocate_processing.s(data),
+                process_pdfs.s(),
+                chunk_pdfs.s(),
+                llama_parse_batch.s()).apply_async()
+                
+                
             
         # Clean up temporary files and folder after upload
         os.remove(temp_zip_path)
