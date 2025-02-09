@@ -51,8 +51,59 @@ import fitz
 from llama_parse import LlamaParse
 from llama_index.core import SimpleDirectoryReader
 
+@shared_task(ack_late=True, bind=True)
+def allocate_mp4_processing(self, class_name, MP4_files):
+    container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
+    processing_mp4_paths = []
+
+    for blob in MP4_files:
+        logger.info(f"Attempting to move {os.path.basename(blob)} to Proccessing\n")
+        try:
+            blob_name = os.path.basename(blob)
+            destination_path = f"{class_name}/Processing/{blob_name}"
+            source_blob_client = container_client.get_blob_client(blob)
+
+            if not source_blob_client.exists():
+                logger.warning(f"Source Blob Not Found: {blob}\n")
+                continue
+
+            #loading in the destination blob client
+            dest_blob_client = container_client.get_blob_client(destination_path)
+
+            #start copy proccess
+            copy_operation = dest_blob_client.start_copy_from_url(source_blob_client.url)
+
+            #wait for copy process
+            while True:
+                props = dest_blob_client.get_blob_properties()
+                copy_status = props.copy.status
+
+                if copy_status == "success":
+                    logger.info(f"Successfully copied {blob} to {destination_path}\n")
+
+                    #delete the original blob
+                    source_blob_client.delete_blob()
+                    logger.info(f"Deleted orginal blob from {blob}")
+                    break
+
+                elif copy_status in ["failed", "aborted"]:
+                    logger.warning(f"Copy operation failed for {blob_name}. Status: {copy_status}")
+                    break
+                time.sleep(2)
+            
+            #append new blob path
+            processing_mp4_paths.append(destination_path)
+        
+        except Exception as e:
+            logger.error(f"Error moving {blob}: {e}")
+    data = (class_name, processing_mp4_paths)
+    return data
+
+
 @shared_task(acks_late=True, bind=True)
-def process_uploaded_files(self, class_name, MP4_files):  # renamed parameter to avoid confusion
+def process_uploaded_files(self, data):
+    #unpacking the data
+    class_name, MP4_files = data
     container_client = blob_service_client.get_container_client(settings.AZURE_CONTAINER)
     temp_download_dir = f"temp/{class_name}"
     processed_mp3_files = []  # new name to avoid shadowing
@@ -134,7 +185,10 @@ def upload_transcriptions(self, data):
         
         for transcript_file in transcript_files:
             try:
-                blob_name = f"{class_name}_transcripts/{os.path.basename(transcript_file)}"
+                #first change - upload to transcriptions within sub blob
+                blob_name = f"{class_name}/Transcriptions/{os.path.basename(transcript_file)}"
+                logger.info(f"Moving to :{blob_name}\n")
+
                 blob_client = container_client.get_blob_client(blob_name)
 
                 with open(transcript_file, "rb") as data:
@@ -144,6 +198,45 @@ def upload_transcriptions(self, data):
                 os.remove(transcript_file)  # Clean up local file after upload
             except Exception as e:
                 logger.info(f"Error uploading {transcript_file}: {e}")
+            
+            #moving the completed transcriptions from Processing to completed
+            try:
+                file_name = os.path.basename(transcript_file).replace("_transcription.txt", ".mp4")
+                source_path = f"{class_name}/Processing/{file_name}"
+                destination_path = f"{class_name}/Completed/{file_name}"
+
+                #generate source blob client
+                source_blob_client = container_client.get_blob_client(source_path)
+
+                if not source_blob_client.exists():
+                    logger.warning(f"Source Blob Not Found:{source_path}\n")
+                    continue
+
+                #generate destination blob client
+                dest_blob_client = container_client.get_blob_client(destination_path)
+
+                #start copy process
+                copy_operation = dest_blob_client.start_copy_from_url(source_blob_client.url)
+
+                #wait for copy process to finish
+                while True:
+                    props = dest_blob_client.get_blob_properties()
+                    copy_status = props.copy.status
+
+                    if copy_status == "success":
+                        logger.info(f"Successfully Copied {file_name} to {destination_path}\n")
+
+                        #delete the original blob
+                        source_blob_client.delete_blob()
+                        logger.info(f"Deleted original blob from {source_path}")
+                        break
+
+                    elif copy_status in ["failed", "aborted"]:
+                        logger.warning(f"Copy operation failed for {blob_name}, Status:{copy_status}\n")
+                        break
+                    time.sleep(2)
+            except Exception as e:
+                logger.error(f"Error moving {file_name}: {e}")
 
         logger.info(f"Successfully uploaded {len(transcript_files)} transcripts for {class_name}")
     except Exception as e:
@@ -156,8 +249,7 @@ def upload_transcriptions(self, data):
         logger.info(f"Error clearing temporary directory {temp_download_dir}: {e}")
         raise
     
-    #callling partition now
-    logger.info("preparing documents to partition")
+    logger.info("Transcription Process Complete, Starting Parsing of Transcripts.\n")
     data = class_name, transcript_paths
     return data
 

@@ -41,7 +41,7 @@ from django.http import HttpResponseNotFound
 from azure.storage.blob import BlobClient
 
 #importing celery tasks
-from transcript.tasks import process_uploaded_files,chunk_pdfs,llama_parse_batch,allocate_processing, process_pdfs, whisper_transcription, upload_transcriptions
+from transcript.tasks import process_uploaded_files,chunk_pdfs,llama_parse_batch,allocate_processing, process_pdfs, whisper_transcription, upload_transcriptions,allocate_mp4_processing
 from celery import chain, signature
 import logging
 
@@ -260,7 +260,8 @@ def upload_class_data(request):
         if MP4_paths:
             blob_class = base_azure_path
             transcript_chain = chain(
-                process_uploaded_files.s(blob_class, MP4_paths),
+                allocate_mp4_processing.s(blob_class, MP4_paths),
+                process_uploaded_files.s(),
                 whisper_transcription.s(),
                 upload_transcriptions.s()).apply_async()
             
