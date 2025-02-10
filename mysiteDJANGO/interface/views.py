@@ -41,7 +41,12 @@ from django.http import HttpResponseNotFound
 from azure.storage.blob import BlobClient
 
 #importing celery tasks
-from transcript.tasks import process_uploaded_files,chunk_pdfs,llama_parse_batch,allocate_processing, process_pdfs, whisper_transcription, upload_transcriptions,allocate_mp4_processing
+from transcript.tasks import (
+                            process_uploaded_files,chunk_pdfs,llama_parse_batch,allocate_processing,
+                            process_pdfs, whisper_transcription, upload_transcriptions,allocate_mp4_processing,
+                            create_pinecone_index, markdown_chunk_embeddings
+                            )
+
 from celery import chain, signature
 import logging
 
@@ -272,7 +277,9 @@ def upload_class_data(request):
                 allocate_processing.s(data),
                 process_pdfs.s(),
                 chunk_pdfs.s(),
-                llama_parse_batch.s()).apply_async()
+                llama_parse_batch.s(),
+                create_pinecone_index.s(),
+                markdown_chunk_embeddings.s()).apply_async()
                 
                 
             

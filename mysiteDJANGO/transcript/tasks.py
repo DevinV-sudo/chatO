@@ -19,6 +19,11 @@ import time
 from dotenv import load_dotenv
 from celery.exceptions import SoftTimeLimitExceeded
 
+#for unique chunk_ids
+from uuid import uuid4
+
+#import ollama for embeddings
+import ollama
 
 #import numpy
 import numpy as np
@@ -50,6 +55,10 @@ import fitz
 #llama parse
 from llama_parse import LlamaParse
 from llama_index.core import SimpleDirectoryReader
+
+#chunking libraries
+from langchain_text_splitters import MarkdownHeaderTextSplitter
+import mistune
 
 @shared_task(ack_late=True, bind=True)
 def allocate_mp4_processing(self, class_name, MP4_files):
@@ -552,9 +561,7 @@ def llama_parse_batch(self, data):
         extract_layout=True,
         num_workers = 4,
         verbose=True
-        # use_vendor_multimodal_model=True,
-        # vendor_multimodal_model_name="openai-gpt-4o-mini",
-        # vendor_multimodal_api_key = settings.OPENAI_API_KEY
+        
     )
 
     #intialize extractor
@@ -673,6 +680,8 @@ def llama_parse_batch(self, data):
             logger.error(f"Error moving {error_blob}: {e}")
 
     # moving successfully parsed files to azure
+    mark_down_paths = []
+
     for pdf_path, doc in successful_extractions.items():
         try:
             #set up a local temp for the output
@@ -692,6 +701,8 @@ def llama_parse_batch(self, data):
             
             # Upload markdown file to Azure Blob Storage
             azure_blob_path = os.path.join(base_azure_path, file_name)
+            mark_down_paths.append(azure_blob_path)
+
             logger.info(f"Upload path for Azure:{azure_blob_path}\n")
 
             #reading the local file to the azure blob
@@ -767,10 +778,16 @@ def llama_parse_batch(self, data):
         logger.error(f"Error removing temporary directory {temp_part_dir}: {e}")
 
     logger.info(f"Successfully Parsed Current Processing Batch")
-    return None
+
+    data = (mark_down_paths, class_name)
+    return data
 
 @shared_task(ack_late=True, bind=True)
-def create_pinecone_index(self, class_name):
+def create_pinecone_index(self, data):
+    #unpack data
+    mark_down_paths, class_name = data
+
+    #generate index
     logger.info(f"[{self.request.id}] Creating Pinecone index for class: {class_name}")
     index_name = class_name.lower().replace("_", "-").replace(" ", "-").strip()
     try:
@@ -778,10 +795,10 @@ def create_pinecone_index(self, class_name):
         logger.debug(f"Existing indexes: {existing_indexes}")
 
         if index_name not in existing_indexes:
-            logger.debug(f"Creating new index {index_name} with dimension 3072")
+            logger.debug(f"Creating new index {index_name} with dimension 768")
             pc.create_index(
                 name=index_name,
-                dimension=3072,
+                dimension=768,
                 metric="cosine",
                 spec=ServerlessSpec(cloud="aws", region="us-east-1"),
             )
@@ -795,19 +812,169 @@ def create_pinecone_index(self, class_name):
             stats = index.describe_index_stats()
             logger.info(f"[{self.request.id}] Pinecone index ready: {index_name}")
             logger.debug(f"Initial index stats: {stats}")
-            data = (class_name, index_name)
-            return data
+            
         else:
             logger.info(f"[{self.request.id}] Index already exists: {index_name}")
             index = pc.Index(index_name)
             stats = index.describe_index_stats()
             logger.debug(f"Existing index stats: {stats}")
-            data = (class_name, index_name)
-            return data
 
     except Exception as e:
         logger.error(f"[{self.request.id}] Error creating Pinecone index: {e}", exc_info=True)
         raise
+    
+    data = (mark_down_paths, class_name, index_name)
+    return data
+
+@shared_task(ack_late=True, bind=True)
+def markdown_chunk_embeddings(self, data):
+    '''
+    Perhaps add a checker for max-token context length
+    add checker for instances with no headers
+    better logic for minimum chunks, maybe concatenate
+    '''
+    #pull the model
+    ollama.pull("nomic-embed-text")
+
+    #Unpack the data
+    mark_down_paths, class_name, index_name = data
+
+    #generate the index
+    index = pc.Index(index_name)
+
+    #set up temp directory for chunking
+    temp_dir = f"temp/{class_name}_MD/"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    #storage for splits
+    splits = []
+
+    #pull blobs from azure back to local
+    for blob in mark_down_paths:
+        source_blob_client = blob_service_client.get_blob_client(container=settings.AZURE_CONTAINER, blob=blob)
+        logger.info(f"retreiving {os.path.basename(blob)}")
+
+        local_file_path = os.path.join(temp_dir, os.path.basename(blob))
+
+        #download blob to local
+        try:
+            with open(local_file_path, "wb") as file:
+                file.write(source_blob_client.download_blob().readall())
+            logger.info(f"Downloaded {os.path.basename(blob)}\n")
+            
+        except Exception as e:
+            logger.error(f"Error downloading {blob}: {e}")
+            continue
+
+        #open the local file
+        with open(local_file_path, "r", encoding="utf-8") as f:
+            document =  f.read()
+
+        if not document:
+            logger.warning(f"Skipping empty document: {os.basename(blob)}")
+            continue
+
+        try:
+            #markdown parser
+            parser = mistune.create_markdown(renderer=mistune.AstRenderer())
+            ast = parser(document)
+
+        except Exception as e:
+            logger.error(f"Markdown Processing Failed for :{os.path.basename(blob)}, {e}")
+            continue
+
+        #extract headers
+        headers = []
+        for node in ast:
+            if node["type"] == "heading":
+                level = node["level"]
+                text = node["children"][0]["text"]
+                headers.append((f"{"#"*level}", text))
+        
+        if len(headers) == 0:
+            logger.error(f"Document has no headers.\n")
+            continue
+        
+        #intialize the splitter
+        markdown_splitter = MarkdownHeaderTextSplitter(headers)
+        md_header_splits = markdown_splitter.split_text(document)
+
+        #minimum chunk length
+        min_length = 25
+        filtered_splits = [split for split in md_header_splits if len(split.page_content.strip()) >= min_length]
+
+        if not filtered_splits:
+            logger.warning(f"All splits are too small.\n")
+            continue
+
+        #store the splits
+        splits.extend(filtered_splits)
+
+    logger.info(f"Completed Document Splits - Proceding to Embedding Stage.")
+
+    #start embedding logic here
+    all_vectors = []
+
+    #iterate through splits
+    for i, split in enumerate(splits):
+        chunk_text = split.page_content
+        chunk_id = str(uuid4())
+
+        try:
+            #currently failing in this block
+            response = ollama.embeddings(model="nomic-embed-text", prompt = chunk_text)
+            embedding = response.embedding
+
+            if not embedding or not isinstance(embedding, list) or not all(isinstance(x, (float, int)) for x in embedding):
+                logger.warning(f"Skipping chunk {i}: Invalid embedding format ({type(embedding)})")
+                continue
+             
+            #create meta-data
+            metadata = {
+                "class_name":str(class_name),
+                "file_name":str(os.path.basename(mark_down_paths[i]) if i < len(mark_down_paths) else "unknown"),
+                "chunk_id":str(chunk_id),
+                "header":str(split.metadata["header"] if split.metadata and "header" in split.metadata else "no header"),
+                "text_size":int(len(chunk_text))
+            }
+
+            if metadata:
+                logger.info(f"Successfully generated chunk meta data for chunk {i}\n")
+
+            else:
+                logger.warning(f"Could not generate meta data for Chunk {i}\n")
+
+            all_vectors.append({
+                "id":chunk_id,
+                "values":embedding,
+                "metadata":metadata
+            })
+            #error embedding chunk 12-:
+        except Exception as e:
+                logger.error(f"Error imbedding chunk {i}\n")
+                continue
+        
+    logger.info(f"Created {len(all_vectors)} Vectors out of {len(splits)} chunks\n")
+
+    #attempt to upsert vectors into vector database
+    if all_vectors:
+            try:
+                logger.info(f"Uploading {len(all_vectors)} vectors to Pinecone...")
+                index.upsert(vectors=all_vectors)  # Pass the entire list at once
+                logger.info("Successfully upserted document embeddings")
+            except Exception as e:
+                logger.error(f"Error Uploading to Pinecone: {e}")
+                
+    
+    return None
+
+
+
+
+
+
+    
+
 
 
 
