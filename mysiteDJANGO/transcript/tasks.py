@@ -58,6 +58,9 @@ from llama_index.core import SimpleDirectoryReader
 
 #chunking libraries
 from langchain_text_splitters import MarkdownHeaderTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+#markdown processing
 import mistune
 
 @shared_task(ack_late=True, bind=True)
@@ -779,13 +782,13 @@ def llama_parse_batch(self, data):
 
     logger.info(f"Successfully Parsed Current Processing Batch")
 
-    data = (mark_down_paths, class_name)
+    data = (class_name, mark_down_paths)
     return data
 
 @shared_task(ack_late=True, bind=True)
 def create_pinecone_index(self, data):
     #unpack data
-    mark_down_paths, class_name = data
+    class_name, mark_down_paths = data
 
     #generate index
     logger.info(f"[{self.request.id}] Creating Pinecone index for class: {class_name}")
@@ -964,9 +967,156 @@ def markdown_chunk_embeddings(self, data):
                 logger.info("Successfully upserted document embeddings")
             except Exception as e:
                 logger.error(f"Error Uploading to Pinecone: {e}")
-                
+
+    #remove the temporary directory after upload
+    try:
+        shutil.rmtree(temp_dir)
+        logger.info(f"Successfully removed temporary directory: {temp_dir}")
     
+    except Exception as e:
+        logger.error(f"Error removing temporary directory {temp_dir}: {e}")
+                
     return None
+
+@shared_task(ack_late=True, bind=True)
+def transcription_chunk_embedding(self, data):
+    #unpack data
+    transcript_paths, class_name, index_name = data
+
+    #initialize pinecone index
+    index = pc.Index(index_name)
+    
+    #generate local directory
+    temp_dir = f"temp/transcripts/{class_name}/"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    #storage for doc partitions
+    splits = []
+
+    #First download the transcripts from blob storage to local
+    for blob in transcript_paths:
+        source_blob_client = blob_service_client.get_blob_client(container=settings.AZURE_CONTAINER, blob=blob)
+        logger.info(f"retreiving {os.path.basename(blob)}")
+
+        local_file_path = os.path.join(temp_dir, os.path.basename(blob))
+
+        #download blob to local
+        try:
+            with open(local_file_path, "wb") as file:
+                file.write(source_blob_client.download_blob().readall())
+            logger.info(f"Downloaded {os.path.basename(blob)}\n")
+            
+        except Exception as e:
+            logger.error(f"Error downloading {blob}: {e}")
+            continue
+
+        #open the local file
+        with open(local_file_path, "r", encoding="utf-8") as f:
+            document =  f.read()
+
+        if not document:
+            logger.warning(f"Skipping empty document: {os.basename(blob)}")
+            continue
+
+        #set up text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=20,
+        length_function=len,
+        is_separator_regex=False,   
+        )
+
+        #genereate documents
+        docs = text_splitter.create_documents([document])
+        if docs:
+            logger.info(f"Document of length: {len(document)} Partioned into {len(docs)} Splits.\n")
+        
+        else:
+            logger.warning(f"No partitions were created for doc: {os.path.basename(blob)}")
+            continue
+
+        #minimum chunk length
+        min_length = 25
+
+        #filter out any accidental small splits
+        filtered_splits = [split for split in docs if len(split.page_content.strip()) >= min_length]
+        
+        if not filtered_splits:
+            logger.warning(f"All splits do not exceded minimum size skipping document\n")
+            continue
+
+        splits.extend(filtered_splits)
+    logger.info(f"Completed Document Splits - Proceding to Embedding Stage.")    
+
+    #embedding step
+    all_vectors = []
+
+    #iterate through splits
+    for i, split in enumerate(splits):
+        chunk_text = split.page_content
+        chunk_id = str(uuid4())
+
+        try:
+            #currently failing in this block
+            response = ollama.embeddings(model="nomic-embed-text", prompt = chunk_text)
+            embedding = response.embedding
+
+            if not embedding or not isinstance(embedding, list) or not all(isinstance(x, (float, int)) for x in embedding):
+                logger.warning(f"Skipping chunk {i}: Invalid embedding format ({type(embedding)})")
+                continue
+             
+            #create meta-data
+            metadata = {
+                "class_name":str(class_name),
+                "file_name":str(os.path.basename(transcript_paths[i]) if i < len(transcript_paths) else "unknown"),
+                "chunk_id":str(chunk_id),
+                "header":str(split.metadata["header"] if split.metadata and "header" in split.metadata else "no header"),
+                "text_size":int(len(chunk_text))
+            }
+
+            if metadata:
+                logger.info(f"Successfully generated chunk meta data for chunk {i}\n")
+
+            else:
+                logger.warning(f"Could not generate meta data for Chunk {i}\n")
+
+            all_vectors.append({
+                "id":chunk_id,
+                "values":embedding,
+                "metadata":metadata
+            })
+            #error embedding chunk 12-:
+        except Exception as e:
+                logger.error(f"Error imbedding chunk {i}\n")
+                continue
+        
+    logger.info(f"Created {len(all_vectors)} Vectors out of {len(splits)} chunks\n")
+
+    #attempt to upsert vectors into vector database
+    if all_vectors:
+            try:
+                logger.info(f"Uploading {len(all_vectors)} vectors to Pinecone...")
+                index.upsert(vectors=all_vectors)  # Pass the entire list at once
+                logger.info("Successfully upserted document embeddings")
+            except Exception as e:
+                logger.error(f"Error Uploading to Pinecone: {e}")
+
+    #remove the temporary directory after upload
+    try:
+        shutil.rmtree(temp_dir)
+        logger.info(f"Successfully removed temporary directory: {temp_dir}")
+    
+    except Exception as e:
+        logger.error(f"Error removing temporary directory {temp_dir}: {e}")
+                
+    return None
+
+
+
+
+
+
+    
 
 
 
