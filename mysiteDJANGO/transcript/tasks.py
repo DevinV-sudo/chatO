@@ -18,6 +18,7 @@ import logging
 import time
 from dotenv import load_dotenv
 from celery.exceptions import SoftTimeLimitExceeded
+import backoff
 
 #for unique chunk_ids
 from uuid import uuid4
@@ -37,8 +38,16 @@ logger = logging.getLogger(__name__)
 #create client
 blob_service_client = BlobServiceClient.from_connection_string(settings.AZURE_CONNECTION_STRING)
 
-#load whisper model
-whisper_model = whisper.load_model('medium')  # Load the model once
+#import openai dependencies
+import openai
+openai.api_key = settings.OPENAI_API_KEY
+client = openai.OpenAI()
+
+#tokenizer for whisper model
+import tiktoken
+
+#import audio splitting software
+from pydub import AudioSegment
 
 #pinecone auth services
 pinecone_api_key = settings.PINECONE_API_KEY
@@ -51,6 +60,7 @@ from PIL import Image
 import pytesseract
 from pdf2image import convert_from_path
 import fitz
+import subprocess
 
 #llama parse
 from llama_parse import LlamaParse
@@ -62,6 +72,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 #markdown processing
 import mistune
+import requests
 
 @shared_task(ack_late=True, bind=True)
 def allocate_mp4_processing(self, class_name, MP4_files):
@@ -150,45 +161,181 @@ def process_uploaded_files(self, data):
         raise
     
     logger.info("beginning whisper transcription")
-    data = (class_name, processed_mp3_files)  # return the processed files
+    data = (class_name, processed_mp3_files, MP4_files)  # return the processed files
     logger.info(f"PROCESS FILES END - Returning data: {data}")
 
     return data
+
+@shared_task(acks_late=True, bind=True)
+def audio_chunking(self, data):
+    logger.info(f"Chunking audio files\n")
+
+    #unpack the data
+    class_name, mp3_files, MP4_files = data
+
+    #set the chunk size (ten minutes)
+    chunk_size = 10 * 60
+
+    #storage for chunks
+    audio_chunks = []
+
+    #create directory for audio chunks to land
+    chunk_path = f"temp/{class_name}/Chunks/"
+    os.makedirs(chunk_path, exist_ok=True)
+
+    #iterate through mp3s and chunk each
+    for file in mp3_files:
+        #create file spcific sub directory for chunks to land
+        sub_chunk_path = f"{os.path.splitext(os.path.basename(file))[0]}"
+        sub_chunk_dir = os.path.join(chunk_path, sub_chunk_path)
+        os.makedirs(sub_chunk_dir, exist_ok=True)
+
+        #create an Audio Segment object
+        audio_file = AudioSegment.from_mp3(file)
+
+        #get length
+        file_length = audio_file.duration_seconds
+        logger.info(f"File length is {file_length / 60} minutes long\n")
+
+        #calculate the number of chunks (10 minute chunks)
+        num_chunks = int(file_length // chunk_size)
+        logger.info(f"attempting to chunk {file} in to {num_chunks} partitions\n")
+
+        #storage for file specfic chunks
+        file_chunks = []
+        for i in range(num_chunks):
+            #convert into milliseconds
+            start_ms = i * chunk_size * 1000
+            end_ms = (i + 1) * chunk_size * 1000
+
+            #check if last iteration
+            if i == num_chunks -1:
+                logger.info(f"Reached last chunk iteration checking for remainder\n")
+                
+                #if there exists more audio data, widen this last chunk
+                if audio_file[end_ms:]:
+                    logger.info(f"Remaining audio detected - concatenating chunks\n")
+                    #set the end_ms to end of file
+                    chunk = audio_file[start_ms:]
+                else:
+                    #if no remainder set chunk as usual
+                    logger.info(f"No Remainder detected\n")
+                    chunk = audio_file[start_ms:end_ms]
+            else:
+                #split audio file
+                chunk = audio_file[start_ms:end_ms]
+
+            #save the chunk
+            file_name = f"Chunk_{i+1}.mp3"
+            file_save_path = os.path.join(sub_chunk_dir, file_name)
+            chunk.export(file_save_path, format="mp3")
+
+            logger.info(f"Saved {file_name} to {file_save_path}\n")
+            file_chunks.append(file_save_path)
+        
+        #append the chunks for said file to the outer storage
+        audio_chunks.append(file_chunks)
+
+    #return the data
+    data = (class_name, audio_chunks, MP4_files)
+    return data
+
+#truncate to maximum token length
+def truncate_to_token(text):
+    #initialize tokenizer
+    tokenizer = tiktoken.get_encoding("cl100k_base")
+
+    #encode the prompt and take the last 224 tokens
+    transcript_tokens = tokenizer.encode(text)
+    truncated_tokens = transcript_tokens[-224:]
+
+    #decode the truncated prompt
+    decoded_prompt = tokenizer.decode(truncated_tokens)
+    return decoded_prompt
+
+@backoff.on_exception(backoff.expo, openai.OpenAIError, max_tries=5)
+def transcribe_with_retry(audio_path, text=""):
+    """Handles API retries with exponential backoff."""
+    with open(audio_path, "rb") as audio_file:
+        #migration to newest openai api 
+        transcription = client.audio.transcriptions.create(
+            model="whisper-1", 
+            file=audio_file, 
+            response_format="text",
+            prompt = text
+            )
+    return transcription.strip()
+### source blob not found
 
 @shared_task(acks_late=True, bind=True)
 def whisper_transcription(self, data):
     logger.info(f"WHISPER START - Received data type: {type(data)}")
     logger.info(f"WHISPER START - Raw data: {data}")
     
-    class_name, mp3_files= data
+    class_name, mp3_files, MP4_files = data
     temp_transcript_dir = f"temp/{class_name}/transcripts"
     os.makedirs(temp_transcript_dir, exist_ok=True)
     
+    #path storage for transcriptions
     transcript_files = []
 
-    for audio_path in mp3_files:
-        try:
-            logger.info(f"Starting transcription for: {audio_path}")
-            transcription_name = os.path.splitext(os.path.basename(audio_path))[0]
-            transcription_file = os.path.join(temp_transcript_dir, f"{transcription_name}_transcription.txt")
-            
-            transcription_text = whisper_model.transcribe(audio_path, fp16=False)["text"].strip()
-            with open(transcription_file, "w") as f:
-                f.write(transcription_text)
+    for idx, chunk_batch in enumerate(mp3_files, start=1):
+        #create an output_txt file
+        output_transcript = os.path.join(temp_transcript_dir, f"Recording_{idx}_transcription.txt")
 
-            transcript_files.append(transcription_file)
-        except Exception as e:
-            logger.info(f"Error transcribing audio file {audio_path}: {e}")
-        
+        #storage for the prompt (reset with each path)
+        previous_text = None
+
+        #iterate through the batch
+        for audio_path in chunk_batch:
+
+            try:
+                logger.info(f"Starting transcription for: {audio_path}")
+
+                #if we have a prompt transcribe with prompt, else no
+                if previous_text:
+                    logger.info(f"Prompt identified - transcribing with prompt\n")
+                    transcription_text = transcribe_with_retry(audio_path=audio_path, text=previous_text)
+
+                if not previous_text:
+                    logger.info(f"No prompt detected - continuing wihtout\n")
+                    transcription_text = transcribe_with_retry(audio_path=audio_path)
+
+                #set the previous text for next audio paths prompt
+                previous_text = truncate_to_token(transcription_text)
+
+                #check if valid transcription was generated
+                if not transcription_text:
+                    logger.error(f"Transcription could not be generated for {os.path.basename(audio_path)}\n")
+                    continue
+
+                #write response to file
+                with open(output_transcript, "a") as f:
+                    f.write(transcription_text + "\n\n")
+
+                #log completion
+                logger.info(f"Transcription finished for Chunk{os.path.basename(audio_path)}")
+
+                #time pause between files
+                time.sleep(30)
+
+            #log open-ai specific errors
+            except openai.OpenAIError as e:
+                logger.error(f"OpenAI API error for {audio_path}: {e}")
+
+            except Exception as e:
+                logger.info(f"Error transcribing audio file {audio_path}: {e}")
+        #After the batch has been appended to the ouput_transcript
+        transcript_files.append(output_transcript)
     
     # Proceed to upload transcriptions
     logger.info("Uploading transcriptions to Azure blob storage")
-    data = (class_name, transcript_files)
+    data = (class_name, transcript_files, MP4_files)
     return data
     
 @shared_task(acks_late=True, bind=True)
 def upload_transcriptions(self, data):
-    class_name, transcript_files = data
+    class_name, transcript_files, MP4_files = data
     temp_download_dir = f'temp/{class_name}'
     transcript_paths = []
 
@@ -206,11 +353,14 @@ def upload_transcriptions(self, data):
                 with open(transcript_file, "rb") as data:
                     blob_client.upload_blob(data, overwrite=True)
                     transcript_paths.append(blob_name)
+                    logger.info(f"Successfully Uploaded {os.path.basename(transcript_file)}")
 
                 os.remove(transcript_file)  # Clean up local file after upload
             except Exception as e:
                 logger.info(f"Error uploading {transcript_file}: {e}")
-            
+        
+        #iterate through the source files
+        for transcript_file in MP4_files:
             #moving the completed transcriptions from Processing to completed
             try:
                 file_name = os.path.basename(transcript_file).replace("_transcription.txt", ".mp4")
@@ -935,10 +1085,9 @@ def markdown_chunk_embeddings(self, data):
             #create meta-data
             metadata = {
                 "class_name":str(class_name),
-                "file_name":str(os.path.basename(mark_down_paths[i]) if i < len(mark_down_paths) else "unknown"),
+                "file_type":"pdf",
                 "chunk_id":str(chunk_id),
-                "header":str(split.metadata["header"] if split.metadata and "header" in split.metadata else "no header"),
-                "text_size":int(len(chunk_text))
+                "text": chunk_text,
             }
 
             if metadata:
@@ -1051,12 +1200,23 @@ def transcription_chunk_embedding(self, data):
     #embedding step
     all_vectors = []
 
+    try:
+        result = subprocess.run(["pgrep", "-f", "ollama"], capture_output=True, text=True)
+        if not result.stdout.strip():
+            logger.info("Starting Ollama...")
+            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Wait a few seconds to ensure it starts
+            time.sleep(3)
+    except Exception as e:
+        logger.error(f"Error starting Ollama: {e}")
+
     #iterate through splits
     for i, split in enumerate(splits):
         chunk_text = split.page_content
         chunk_id = str(uuid4())
 
         try:
+
             #currently failing in this block
             response = ollama.embeddings(model="nomic-embed-text", prompt = chunk_text)
             embedding = response.embedding
@@ -1068,10 +1228,9 @@ def transcription_chunk_embedding(self, data):
             #create meta-data
             metadata = {
                 "class_name":str(class_name),
-                "file_name":str(os.path.basename(transcript_paths[i]) if i < len(transcript_paths) else "unknown"),
+                "file_type":"transcript",
                 "chunk_id":str(chunk_id),
-                "header":str(split.metadata["header"] if split.metadata and "header" in split.metadata else "no header"),
-                "text_size":int(len(chunk_text))
+                "text": chunk_text,
             }
 
             if metadata:

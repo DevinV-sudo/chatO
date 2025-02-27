@@ -44,7 +44,8 @@ from azure.storage.blob import BlobClient
 from transcript.tasks import (
                             process_uploaded_files,chunk_pdfs,llama_parse_batch,allocate_processing,
                             process_pdfs, whisper_transcription, upload_transcriptions,allocate_mp4_processing,
-                            create_pinecone_index, markdown_chunk_embeddings, transcription_chunk_embedding
+                            create_pinecone_index, markdown_chunk_embeddings, transcription_chunk_embedding,
+                            audio_chunking
                             )
 
 from celery import chain, signature
@@ -267,6 +268,7 @@ def upload_class_data(request):
             transcript_chain = chain(
                 allocate_mp4_processing.s(blob_class, MP4_paths),
                 process_uploaded_files.s(),
+                audio_chunking.s(),
                 whisper_transcription.s(),
                 upload_transcriptions.s(),
                 create_pinecone_index.s(),
