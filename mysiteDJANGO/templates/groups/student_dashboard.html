@@ -2,9 +2,80 @@
 <html>
 <head>
     <title>Student Dashboard</title>
-</head>
-<body>
-    <h1>Welcome to the Student Dashboard</h1>
+    <style>
+        /* Container for the user menu in the top-right corner */
+        .user-menu {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            cursor: pointer;
+        }
+        /* Circle avatar styling */
+        .user-avatar {
+            width: 40px;
+            height: 40px;
+            background-color: #3498db;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 18px;
+        }
+        /* Dropdown menu styling */
+        .dropdown-menu {
+            display: none;
+            position: absolute;
+            top: 55px;
+            right: 10px;
+            background-color: #fff;
+            border: 1px solid #ccc;
+            box-shadow: 0px 8px 16px rgba(0,0,0,0.2);
+            z-index: 1;
+            width: 150px;
+        }
+        .dropdown-menu a, .dropdown-menu form {
+            display: block;
+            padding: 10px;
+            text-decoration: none;
+            color: #333;
+            margin: 0;
+        }
+        .dropdown-menu a:hover {
+            background-color: #f1f1f1;
+        }
+        .dropdown-menu button {
+            background: none;
+            border: none;
+            width: 100%;
+            text-align: left;
+            padding: 0;
+            cursor: pointer;
+        }
+        .dropdown-menu button:hover {
+            background-color: #f1f1f1;
+        }
+    </style>
+    </head>
+    <body>
+        <!-- User menu in the top-right corner -->
+    <div class="user-menu" onclick="toggleDropdown()">
+        <!-- Display the user's initial inside the circle. Adjust as needed to show the full name -->
+        <div class="user-avatar">{{ user.username|slice:":1"|upper }}</div>
+    </div>
+    <!-- Dropdown menu that appears when the user clicks on the avatar -->
+    <div id="dropdownMenu" class="dropdown-menu">
+        <!-- Link to the change password page -->
+        <a href="{% url 'password_change_page' %}">Change Password</a>
+        <!-- Logout form -->
+        <form action="{% url 'logout' %}" method="post">
+            {% csrf_token %}
+            <button type="submit">Log Out</button>
+        </form>
+    </div>
+
+    <h1>Student Dashboard</h1>
     <br>
     <!-- Display messages -->
     {% if messages %}
@@ -17,23 +88,24 @@
     
     <h2>Select Your Class</h2>
     <h5>(access your class home page)</h5>
-    <form method="post" action="{% url 'student_dashboard' %}">  <!-- Change here -->
+    <form method="post" action="{% url 'student_dashboard' %}">
         {% csrf_token %}
-        {{ form.class_choice }}  <!-- This renders the dropdown for class_choice -->
+        {{ form.class_choice }}
         <button type="submit">Submit Class Selection</button>
     </form>
-    <br><br>
-    <h2>Change Password</h2>
-    <form method="post">
-        {% csrf_token %}
-        {{ password_form.as_p }}  <!-- Render password change fields -->
-        <button type="submit">Change Password</button>
-    </form>
-    <br><br>
-    <form action="{% url 'logout' %}" method="post">
-        {% csrf_token %}
-        <button type="submit">Log Out</button>
-    </form>
+
+    <script>
+        function toggleDropdown() {
+            var dropdown = document.getElementById('dropdownMenu');
+            dropdown.style.display = (dropdown.style.display === 'block') ? 'none' : 'block';
+        }
+        // Optional: close dropdown when clicking outside of it
+        window.onclick = function(event) {
+            if (!event.target.closest('.user-menu')) {
+                document.getElementById('dropdownMenu').style.display = 'none';
+            }
+        }
+    </script>
 </body>
 </html>
 

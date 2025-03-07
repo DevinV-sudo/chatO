@@ -12,6 +12,9 @@ from django.contrib import messages
 from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.forms import PasswordChangeForm
 from django.contrib.auth.models import Group, User
+from django.contrib.auth import update_session_auth_hash
+from django.contrib.auth.decorators import login_required
+
 
 #django templates imports
 from django.template import TemplateDoesNotExist
@@ -35,7 +38,6 @@ import csv
 
 #misc. django imports
 from django.shortcuts import render, redirect
-from django.http import HttpResponseNotFound
 
 #import blob client
 from azure.storage.blob import BlobClient
@@ -75,39 +77,53 @@ def create_group(request):
 
             # Provide success feedback to the user
             messages.success(request, f'Class {group_name} created successfully!')
+        else:
+            messages.info(request, f'Class {group_name} already exists.')
 
-            # Define the HTML template content
-            template_content = f"""<!DOCTYPE html>
-            <html>
-                <head>
-                    <title>{group_name} Class</title>
-                </head>
-                <body>
-                    <h1>Welcome to the {group_name} Class</h1>
-                    <p>This is the template for the {group_name} class.</p>
-                    <!-- Additional content can be added here -->
-                    <form action="{{% url 'student_dashboard' %}}" method="get">
-                        <button type="submit">Return to Dashboard</button>
-                    </form>
-                </body>
-            </html>
-            """
-
-            # Define the template directory and ensure it exists
-            template_directory = os.path.join('templates', 'classes')
-            os.makedirs(template_directory, exist_ok=True)  # Ensure the directory exists
-
-            # Define the full file path for the new template
-            template_file_path = os.path.join(template_directory, f'{group_name}.html')
-
-            # Write the template content to the new file
-            with open(template_file_path, 'w') as template_file:  # Use open instead of default_storage
-                template_file.write(template_content)
-
-            messages.success(request, f'Template for Class {group_name} created successfully!')
     else:
-        messages.info(request, f'Class {group_name} already exists.')
+        messages.error(request, 'There was an error with your submission')
     return group_form
+
+def home(request):
+    logger.info(f"Request received from {request.user.username if request.user.is_authenticated else 'unauthenticated user'}")
+    
+    # If the user is authenticated
+    if request.user.is_authenticated:
+        if request.user.is_superuser:
+            logger.info("Redirecting to admin dashboard")
+            return redirect('admin_dashboard')  # Redirect to admin dashboard
+        elif request.user.groups.filter(name='Professors').exists():
+            logger.info("Redirecting to professor dashboard")
+            return redirect('prof_dashboard')  # Redirect to professor dashboard
+        elif request.user.groups.filter(name='Students').exists():
+            logger.info("Redirecting to student dashboard")
+            return redirect('student_dashboard')  # Redirect to student dashboard
+        else:
+            # In case the user doesn't belong to any of the specified groups
+            logger.warning("User doesn't belong to any known group, redirecting to home")
+            return redirect('home')  # Redirect to a default page
+    else:
+        # If the user is not authenticated, redirect to login
+        logger.info("User is not authenticated, redirecting to login")
+        return redirect('login')
+
+def change_password(request):
+    logger = logging.getLogger(__name__)
+    logger.debug('Change password view hit')  # Log the hit
+
+    if request.method == 'POST':
+        password_form = PasswordChangeForm(request.user, request.POST)
+        if password_form.is_valid():
+            password_form.save()
+            update_session_auth_hash(request, request.user)  # Keep user logged in after password change
+            messages.success(request, 'Your password has been changed successfully.')
+            return redirect('student_dashboard')  # Redirect back to the student dashboard
+    else:
+        password_form = PasswordChangeForm(request.user)
+    
+    return render(request, 'registration/password_change_form.html', {
+        'password_form': password_form
+    })
     
 def upload_roster(request):
     upload_form = UploadRosterForm(request.POST, request.FILES)
@@ -331,29 +347,35 @@ def prof_dashboard(request):
     return render(request, 'groups/prof_dashboard.html', context)
 
 def student_dashboard(request):
-    if request.method == 'POST':
-        form = SelectClassForm(request.POST)
-        password_form = PasswordChangeForm(request.user, request.POST)
-        if password_form.is_valid():
-            user = password_form.save()
-            update_session_auth_hash(request, user)  # Keep the user logged in after password change
-            messages.success(request, 'Your Password Has Been Changed Successfully')
-            return redirect('student_dashboard')
+    logger = logging.getLogger(__name__)
+    logger.debug(f'Student dashboard view, method: {request.method}')
+
+    form = SelectClassForm(request.POST or None)
     
+    if request.method == 'POST':
+        logger.debug('Processing form submission')
+
+        # Handle class selection form
         if form.is_valid():
+            logger.debug('Class form is valid')
             selected_class_id = form.cleaned_data['class_choice']
-            selected_group = Group.objects.get(id = selected_class_id)
+            try:
+                selected_group = Group.objects.get(id=selected_class_id)
+            except Group.DoesNotExist:
+                messages.error(request, "The selected class does not exist.")
+                return redirect('student_dashboard')
             
             try:
-                student = Student.objects.get(user = request.user)
+                student = Student.objects.get(user=request.user)
                 if student.group == selected_group:
+                    # Check if the template exists and render
                     template_name = f'classes/{selected_group.name}.html'
-
                     try:
                         get_template(template_name)
                         return render(request, template_name, {'class_name': selected_group.name})
                     except TemplateDoesNotExist:
-                        return HttpResponseNotFound("The class template does not exist.")
+                        messages.error(request, "Class template does not exist.")
+                        return redirect('student_dashboard')
                 else:
                     messages.error(request, "You are not enrolled in this class.")
             except Student.DoesNotExist:
@@ -361,14 +383,10 @@ def student_dashboard(request):
                 return redirect('home')  # Redirect to an appropriate error handling view
     else:
         form = SelectClassForm()
-        password_form = PasswordChangeForm(request.user)
-
-
 
     return render(request, 'groups/student_dashboard.html', {
-                  'form': form,
-                  'password_form' : password_form,
-                  })
+        'form': form,
+    })
                   
 def admin_dashboard(request):
     return render(request, 'groups/admin_dashboard.html')

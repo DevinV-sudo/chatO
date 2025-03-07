@@ -61,7 +61,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    'interface.middleware.GroupRedirectMiddleware',
+    # 'interface.middleware.GroupRedirectMiddleware',
 ]
 
 ROOT_URLCONF = "mysiteDJANGO.urls"
