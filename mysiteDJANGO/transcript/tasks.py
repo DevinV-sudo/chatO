@@ -979,6 +979,85 @@ def create_pinecone_index(self, data):
     data = (mark_down_paths, class_name, index_name)
     return data
 
+def extract_source_doc_name(blob_path: str) -> str:
+    '''
+    Helper function, extracts the file name from the file path, then trims away the .md suffix,
+    and the preceding chunking label (if present)
+    '''
+
+    #seperate the file name
+    directory, file_name = os.path.split(blob_path)
+
+    #chunk positional flag pattern
+    chunk_pattern = r'_chunk_\d+-\d+\.md$'
+
+    #remove the chunk flag
+    if re.search(chunk_pattern, file_name):
+        cleaned = re.sub(chunk_pattern, '', file_name)
+    #if no chunk flag, remove file type suffix
+    elif file_name.endswith('.md'):
+        cleaned = file_name[:-3]
+    #in the case neither exist return the file_name
+    else:
+        cleaned = file_name
+
+    return cleaned
+
+def generate_keywords(chunk_text: str) -> list[str]:
+    '''
+    This function is in charge of generating a list of keywords associated with a input text excerpt.
+    it makes an API call to Open-AI and generates a list used for connecting passages via keyword similarity.
+    '''
+
+    #generate the prompt for extracting keywords
+    prompt = (
+        f"""
+        You are extracting a list of prominent and general keywords from the following text excerpt.
+        Provide the extracted keywords as a comma-separated list.
+
+        ### Guidelines:
+        - Output only a comma-separated list of relevant and broadly applicable keywords.
+        - Ensure the keywords capture the core themes of the text excerpt.
+        - The keywords should be general enough that similar passages may share some of these keywords.
+        - Avoid overly specific terms that only apply to very narrow contexts.
+
+        ### Example output:
+        [pandas, dataframe, histogram, ethics]
+
+        ### Text Excerpt:
+        {chunk_text}
+        """
+        )
+    
+    try:
+        #make the api call to OpenAI
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an expert assistant that extracts key words from text."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=50,
+            temperature=0.3
+        )
+    except Exception as e:
+        logging.error(f"Error making OpenAI API call: {e}\n")
+        return []
+    
+    #extract the text output
+    response_text = response.choices[0].message.content.strip()
+
+    #remove potential brackets or extra white space
+    if response_text.startswith('[') and response_text.ends_with(']'):
+        response_text = response_text[1:-1]
+
+    #convert to a list
+    response_list = [keyword.strip().lower() for keyword in response_text.split(',') if keyword.strip()]
+    return response_list
+
+
+
+
 @shared_task(ack_late=True, bind=True)
 def markdown_chunk_embeddings(self, data):
     '''
@@ -1000,10 +1079,33 @@ def markdown_chunk_embeddings(self, data):
     os.makedirs(temp_dir, exist_ok=True)
 
     #storage for splits
-    splits = []
+    # splits = []
+
+    #storage for metadata
+    metadata_dict = {}
 
     #pull blobs from azure back to local
     for blob in mark_down_paths:
+        #extract the source file name from the blob path
+        source_name = extract_source_doc_name(blob)
+
+        #check if exists in the dict, if not add the new source file name
+        if source_name not in metadata_dict:
+            logger.info(f"Source name not detected, adding source name: {source_name}\n")
+
+            #initialize as a nested dictionary to store the accumulator, splits, and their count number
+            metadata_dict[source_name] = {}
+
+            #initialize accumulator at zero
+            metadata_dict[source_name]["accumulator"] = 0
+
+            #initialize empty list for splits
+            metadata_dict[source_name]["splits"] = []
+
+        else:
+            logger.info(f"Source name detected, continuing processing.\n")
+
+        #pull azure blob to local
         source_blob_client = blob_service_client.get_blob_client(container=settings.AZURE_CONTAINER, blob=blob)
         logger.info(f"retreiving {os.path.basename(blob)}")
 
@@ -1024,7 +1126,7 @@ def markdown_chunk_embeddings(self, data):
             document =  f.read()
 
         if not document:
-            logger.warning(f"Skipping empty document: {os.basename(blob)}")
+            logger.warning(f"Skipping empty document: {os.path.basename(blob)}")
             continue
 
         try:
@@ -1042,7 +1144,7 @@ def markdown_chunk_embeddings(self, data):
             if node["type"] == "heading":
                 level = node["level"]
                 text = node["children"][0]["text"]
-                headers.append((f"{"#"*level}", text))
+                headers.append((f"{'#'*level}", text))
         
         if len(headers) == 0:
             logger.error(f"Document has no headers.\n")
@@ -1054,59 +1156,108 @@ def markdown_chunk_embeddings(self, data):
 
         #minimum chunk length
         min_length = 25
-        filtered_splits = [split for split in md_header_splits if len(split.page_content.strip()) >= min_length]
+
+        #filter the splits, and store and accumulate their structural count
+        for split in md_header_splits:
+            #check for minimum text length
+            if len(split.page_content.strip()) >= min_length:
+
+                #extract the current source file split count
+                count = metadata_dict[source_name]["accumulator"]
+
+                #store in sub dictionary 
+                split_dict = {"count": count, "split": split}
+
+                #store the split data
+                metadata_dict[source_name]["splits"].append(split_dict)
+
+                #accumulate the iterator
+                metadata_dict[source_name]["accumulator"] += 1
+
+        #extract the list of dictionaries for the filtered splits
+        filtered_splits = metadata_dict[source_name]["splits"]
 
         if not filtered_splits:
             logger.warning(f"All splits are too small.\n")
             continue
 
-        #store the splits
-        splits.extend(filtered_splits)
+    #get the metadata source name list
+    source_name_list = metadata_dict.keys()
+    logger.info(f"Extracted splits from {len(source_name_list)} unique documents:\n")
+    total_splits = 0
+    for name in source_name_list:
+        num_records = len(metadata_dict[name]["splits"])
+        total_splits += num_records
+        logger.info(f"Source File: {name}, Number of Records: {num_records}\n")
 
+    #log successfull completion of splits
     logger.info(f"Completed Document Splits - Proceding to Embedding Stage.")
 
     #start embedding logic here
     all_vectors = []
 
-    #iterate through splits
-    for i, split in enumerate(splits):
-        chunk_text = split.page_content
-        chunk_id = str(uuid4())
+    #iterate through unique source file names
+    for name in source_name_list:
+        #extract the data from source name
+        data = metadata_dict[name]["splits"]
+        
+        #iterate through the list of split dicts
+        for split_dict in data:
+            #seperate the structural number, and the split itself
+            split = split_dict["split"]
+            split_number = split_dict["count"]
 
-        try:
-            #currently failing in this block
-            response = ollama.embeddings(model="nomic-embed-text", prompt = chunk_text)
-            embedding = response.embedding
+            #extract the required metadata
+            source_file = name
+            chunk_text = split.page_content
+            chunk_id = str(uuid4())
 
-            if not embedding or not isinstance(embedding, list) or not all(isinstance(x, (float, int)) for x in embedding):
-                logger.warning(f"Skipping chunk {i}: Invalid embedding format ({type(embedding)})")
-                continue
-             
-            #create meta-data
-            metadata = {
-                "class_name":str(class_name),
-                "file_type":"pdf",
-                "chunk_id":str(chunk_id),
-                "text": chunk_text,
-            }
+            #generate keywords metadata
+            try:
+                keywords = generate_keywords(chunk_text)
+                logger.info(f"Successfully generated {len(keywords)} keywords for Document: {source_file} - Passage: {split_number}.\n")
 
-            if metadata:
-                logger.info(f"Successfully generated chunk meta data for chunk {i}\n")
+            except Exception as e:
+                logger.warning(f"Failed to generate key word list for Document:{source_file} - Passage:{split_number}.\n")
 
-            else:
-                logger.warning(f"Could not generate meta data for Chunk {i}\n")
+            try:
+                #generate an embedding
+                response = ollama.embeddings(model="nomic-embed-text", prompt = chunk_text)
+                embedding = response.embedding
 
-            all_vectors.append({
+                #verify generated embedding is of valid format
+                if not embedding or not isinstance(embedding, list) or not all(isinstance(x, (float, int)) for x in embedding):
+                    logger.warning(f"Skipping Document: {source_file} - Passage: {split_number}: Invalid embedding format ({type(embedding)})")
+                    continue
+
+                #create the vector metadata (structural position: [source file, iteration number], text, and ID)
+                metadata = {
+                    "chunk_id": str(chunk_id),
+                    "class_name": str(class_name),
+                    "source_file": str(source_file),
+                    "passage_number": int(split_number),
+                    "keywords": keywords,
+                    "text": chunk_text,
+                }
+
+                if metadata:
+                    logger.info(f"Successfully generated metadata for Document: {source_file} - Passage: {split_number}.\n")
+                else:
+                    logger.warning(f"Could not generate meta data for Document: {source_file} - Passage: {split_number}.\n")
+
+                #store the vector with recorded meta-data
+                all_vectors.append({
                 "id":chunk_id,
                 "values":embedding,
                 "metadata":metadata
-            })
-            #error embedding chunk 12-:
-        except Exception as e:
-                logger.error(f"Error imbedding chunk {i}\n")
+                })
+            
+            #log exceptions to vector embedding logic
+            except Exception as e:
+                logger.error(f"Error Embedding Document: {source_file} - Passage: {split_number}.\n Skipping Chunk...\n")
                 continue
-        
-    logger.info(f"Created {len(all_vectors)} Vectors out of {len(splits)} chunks\n")
+    #log ratio of completions
+    logger.info(f"Created {len(all_vectors)} Vectors out of {total_splits} chunks\n")
 
     #attempt to upsert vectors into vector database
     if all_vectors:
@@ -1126,6 +1277,65 @@ def markdown_chunk_embeddings(self, data):
         logger.error(f"Error removing temporary directory {temp_dir}: {e}")
                 
     return None
+
+    # #iterate through splits
+    # for i, split in enumerate(splits):
+    #     chunk_text = split.page_content
+    #     chunk_id = str(uuid4())
+
+    #     try:
+    #         #currently failing in this block
+    #         response = ollama.embeddings(model="nomic-embed-text", prompt = chunk_text)
+    #         embedding = response.embedding
+
+    #         if not embedding or not isinstance(embedding, list) or not all(isinstance(x, (float, int)) for x in embedding):
+    #             logger.warning(f"Skipping chunk {i}: Invalid embedding format ({type(embedding)})")
+    #             continue
+             
+    #         #create meta-data
+    #         metadata = {
+    #             "class_name":str(class_name),
+    #             "file_type":"pdf",
+    #             "chunk_id":str(chunk_id),
+    #             "text": chunk_text,
+    #         }
+
+    #         if metadata:
+    #             logger.info(f"Successfully generated chunk meta data for chunk {i}\n")
+
+    #         else:
+    #             logger.warning(f"Could not generate meta data for Chunk {i}\n")
+
+    #         all_vectors.append({
+    #             "id":chunk_id,
+    #             "values":embedding,
+    #             "metadata":metadata
+    #         })
+    #         #error embedding chunk 12-:
+    #     except Exception as e:
+    #             logger.error(f"Error imbedding chunk {i}\n")
+    #             continue
+        
+    # logger.info(f"Created {len(all_vectors)} Vectors out of {len(splits)} chunks\n")
+
+    # #attempt to upsert vectors into vector database
+    # if all_vectors:
+    #         try:
+    #             logger.info(f"Uploading {len(all_vectors)} vectors to Pinecone...")
+    #             index.upsert(vectors=all_vectors)  # Pass the entire list at once
+    #             logger.info("Successfully upserted document embeddings")
+    #         except Exception as e:
+    #             logger.error(f"Error Uploading to Pinecone: {e}")
+
+    # #remove the temporary directory after upload
+    # try:
+    #     shutil.rmtree(temp_dir)
+    #     logger.info(f"Successfully removed temporary directory: {temp_dir}")
+    
+    # except Exception as e:
+    #     logger.error(f"Error removing temporary directory {temp_dir}: {e}")
+                
+    # return None
 
 @shared_task(ack_late=True, bind=True)
 def transcription_chunk_embedding(self, data):
@@ -1164,7 +1374,7 @@ def transcription_chunk_embedding(self, data):
             document =  f.read()
 
         if not document:
-            logger.warning(f"Skipping empty document: {os.basename(blob)}")
+            logger.warning(f"Skipping empty document: {os.path.basename(blob)}")
             continue
 
         #set up text splitter
