@@ -1011,22 +1011,24 @@ def generate_keywords(chunk_text: str) -> list[str]:
 
     #generate the prompt for extracting keywords
     prompt = (
-        f"""
-        You are extracting a list of prominent and general keywords from the following text excerpt.
-        Provide the extracted keywords as a comma-separated list.
+            f"""
+            You are extracting a list of prominent and general keywords from the following text excerpt.
+            Provide the extracted keywords as a comma-separated list.
 
-        ### Guidelines:
-        - Output only a comma-separated list of relevant and broadly applicable keywords.
-        - Ensure the keywords capture the core themes of the text excerpt.
-        - The keywords should be general enough that similar passages may share some of these keywords.
-        - Avoid overly specific terms that only apply to very narrow contexts.
+            ### Guidelines:
+            - Output only a comma-separated list of relevant and broadly applicable keywords.
+            - Ensure the keywords capture the core themes of the text excerpt.
+            - The keywords should be general enough that similar passages may share some of these keywords.
+            - **Ignore any text that appears to be part of tables or tabular data.**
+            - ** No returned keywords should include special characters **
+            - Avoid overly specific terms that apply only to narrow contexts.
 
-        ### Example output:
-        [pandas, dataframe, histogram, ethics]
+            ### Example output:
+            [pandas, dataframe, histogram, ethics]
 
-        ### Text Excerpt:
-        {chunk_text}
-        """
+            ### Text Excerpt:
+            {chunk_text}
+            """
         )
     
     try:
